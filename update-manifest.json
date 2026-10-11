@@ -1,5 +1,5 @@
 {
-  "version": "2.6.1",
+  "version": "2.6.2",
   "date": "2026-10-11",
   "files": {
     "main.py": "8043668660dae0d714715ecde48cf52f2afc93a79dd8bbc46212dc18ff494b18",
@@ -39,6 +39,6 @@
     "electron-app/renderer/overlay.html": "86baa4285cec311c558a1c37c7ea33f2b0cfdfb69bceac3d806afca32d02db85",
     "electron-app/renderer/picker.html": "69564167c04a19670b19276fe0528bd9a4febbcdc8143aa0f7046a1112192466",
     "electron-app/renderer/styles.css": "6f9282586318697e8fc92f516062da61e963100dc1e2617bb24179916232dd72",
-    "electron-app/package.json": "7698fed886254ae1167bfdc57c593b345ed72481ce5105028970df0f672df30a"
+    "electron-app/package.json": "1f395f2749484a2cfb6d502c0b32244ce60f828eb3ec761d76e2aa86ce727c31"
   }
 }
