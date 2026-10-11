@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.6.2] – 2026-10-11
+
+### Fixed
+- **Fermeture de l'app** : fermer MacroEngine arrête maintenant tout (moteur, overlay, installations en arrière-plan) — plus aucun processus ne reste ouvert, même si l'overlay était affiché
+- **Double lancement** : relancer MacroEngine alors qu'il est déjà ouvert ramène simplement la fenêtre existante
+
+---
+
 ## [2.6.1] – 2026-10-11
 
 ### Fixed
