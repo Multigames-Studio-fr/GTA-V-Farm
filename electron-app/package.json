@@ -1,6 +1,6 @@
 {
   "name": "macro-engine",
-  "version": "2.6.0",
+  "version": "2.6.1",
   "description": "MacroEngine — Système d'automatisation par macros",
   "main": "main.js",
   "scripts": {

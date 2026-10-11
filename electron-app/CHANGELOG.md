@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.6.1] – 2026-10-11
+
+### Fixed
+- **Raccourci de l'overlay** : plus de touche par défaut (F8 ouvrait aussi la console FiveM) — choisis la tienne dans Paramètres › Raccourcis
+- **Touche F8** : désormais refusée pour tous les raccourcis, elle reste réservée à la console FiveM
+
+### Changed
+- **Téléchargement** : les fichiers portent maintenant la version dans leur nom (ex. MacroEngine-Portable-2.6.1.exe)
+
+---
+
 ## [2.6.0] – 2026-10-11
 
 ### Added
