@@ -4,7 +4,7 @@ const { app, BrowserWindow, ipcMain, globalShortcut, dialog, screen } = require(
 const path    = require('path');
 const fs      = require('fs');
 const https   = require('https');
-const { spawn, execSync } = require('child_process');
+const { spawn, spawnSync, execSync } = require('child_process');
 const { checkForUpdates } = require('./updater');
 
 // ── Config centralisée ────────────────────────────────────────────────────────
@@ -301,7 +301,9 @@ function createWindow () {
 
   mainWindow.on('resize', saveBounds);
   mainWindow.on('move',   saveBounds);
-  mainWindow.on('closed', () => { mainWindow = null; });
+  // Closing the main window quits the whole app — the overlay/picker windows
+  // would otherwise keep Electron (and the Python engine) alive in the background.
+  mainWindow.on('closed', () => { mainWindow = null; app.quit(); });
 }
 
 // ── Mise à jour automatique ───────────────────────────────────────────────────
@@ -366,9 +368,14 @@ function ensureUserFiles() {
   }
 }
 
+// Background children (pip installs…) — killed on quit so nothing outlives the app.
+const _childProcs = new Set();
+
 function _runChildStreaming(exe, args, onLine, opts) {
   return new Promise((resolve, reject) => {
     const proc = spawn(exe, args, { windowsHide: true, ...opts });
+    _childProcs.add(proc);
+    proc.on('exit', () => _childProcs.delete(proc));
     let lastLine = '';
     const relay = d => {
       const text = d.toString().trim();
@@ -455,6 +462,19 @@ async function ensureOcrDeps() {
     writeLog('ERROR', 'OCR: installation EasyOCR/WinRT échouée après plusieurs tentatives —', e.message);
     // Non-fatal — ocr_engine.py falls back to native WinRT / Tesseract on its own.
   }
+}
+
+// Single instance: a second launch just brings the existing window back
+// instead of starting a second engine fighting over the global shortcuts.
+if (!app.requestSingleInstanceLock()) {
+  app.exit(0);
+} else {
+  app.on('second-instance', () => {
+    if (!mainWindow) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
 }
 
 app.whenReady().then(() => {
@@ -593,15 +613,24 @@ function startEngine() {
   });
 }
 
-function killEngine() {
-  if (!engineProc) return;
+// Kill a process and its whole tree. `sync` waits for taskkill — used on quit,
+// where an async spawn could still be pending when Electron exits.
+function _killTree(pid, sync) {
+  if (!pid) return;
   try {
     if (process.platform === 'win32') {
-      spawn('taskkill', ['/F', '/T', '/PID', String(engineProc.pid)], { windowsHide: true });
+      const args = ['/F', '/T', '/PID', String(pid)];
+      if (sync) spawnSync('taskkill', args, { windowsHide: true, timeout: 5000 });
+      else spawn('taskkill', args, { windowsHide: true });
     } else {
-      engineProc.kill('SIGTERM');
+      process.kill(pid, 'SIGTERM');
     }
   } catch (_) {}
+}
+
+function killEngine({ sync = false } = {}) {
+  if (!engineProc) return;
+  _killTree(engineProc.pid, sync);
   engineProc = null;
   // The killed proc's 'close' is ignored once a new engine starts, so its
   // buffer/pending requests are flushed here rather than there.
@@ -1386,7 +1415,11 @@ ipcMain.handle('app:changelog', () => {
 // ── IPC: restart ──────────────────────────────────────────────────────────────
 ipcMain.handle('app:restart', () => {
   // app.exit() skips will-quit/window-all-closed — kill the engine explicitly.
-  killEngine();
+  killEngine({ sync: true });
+  for (const p of _childProcs) _killTree(p.pid, true);
+  // Release the single-instance lock first, or the relaunched instance would
+  // see it still held and exit immediately.
+  app.releaseSingleInstanceLock();
   app.relaunch();
   app.exit(0);
 });
@@ -1611,6 +1644,9 @@ ipcMain.handle('log:clear', () => {
 app.on('will-quit', () => {
   writeLog('INFO', '═══ MacroEngine fermeture ═══');
   globalShortcut.unregisterAll();
-  killEngine();
+  for (const w of BrowserWindow.getAllWindows()) { try { w.destroy(); } catch (_) {} }
+  killEngine({ sync: true });
+  for (const p of _childProcs) _killTree(p.pid, true);
+  _childProcs.clear();
 });
 
