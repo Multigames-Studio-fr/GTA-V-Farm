@@ -555,8 +555,11 @@ async function loadAppSettings() {
     const pauseEl      = document.getElementById('set-shortcut-pause');
     const recStopEl    = document.getElementById('set-shortcut-record-stop');
     const overlayKeyEl = document.getElementById('set-shortcut-overlay');
-    if (overlayKeyEl) overlayKeyEl.value = s.shortcutOverlay || 'F8';
-    _globalShortcutMap.overlay = keyToAccelerator(s.shortcutOverlay || 'F8') || 'F8';
+    // No default overlay hotkey; a stored F8 (FiveM console) is dropped.
+    const overlayKey = (s.shortcutOverlay && s.shortcutOverlay.toUpperCase() !== 'F8') ? s.shortcutOverlay : '';
+    if (overlayKeyEl) overlayKeyEl.value = overlayKey;
+    if (overlayKey && keyToAccelerator(overlayKey)) _globalShortcutMap.overlay = keyToAccelerator(overlayKey);
+    else delete _globalShortcutMap.overlay;
     if (stopEl    && s.shortcutStop)       stopEl.value       = s.shortcutStop;
     if (pauseEl   && s.shortcutPause)      pauseEl.value      = s.shortcutPause;
     if (recStopEl && s.shortcutRecordStop) recStopEl.value    = s.shortcutRecordStop;
@@ -765,12 +768,18 @@ async function saveShortcutSettings() {
   const recStopKey    = document.getElementById('set-shortcut-record-stop').value.trim();
   const overlayKey    = (document.getElementById('set-shortcut-overlay')?.value || '').trim();
   const statusEl      = document.getElementById('shortcut-status');
+  // F8 opens FiveM's console — never bind anything to it.
+  if ([stopKey, pauseKey, recStopKey, overlayKey].some(k => k.toUpperCase() === 'F8')) {
+    statusEl.textContent = '❌ F8 est réservée à la console FiveM — choisis une autre touche.';
+    statusEl.style.color = 'var(--accent)';
+    return;
+  }
   try {
     const s = (await window.api.readSettings()) || {};
     s.shortcutStop       = stopKey;
     s.shortcutPause      = pauseKey;
     s.shortcutRecordStop = recStopKey;
-    s.shortcutOverlay    = overlayKey || 'F8';
+    s.shortcutOverlay    = overlayKey;
     await window.api.writeSettings(s);
     const invalid = [];
     const setAcc = (action, raw, fallback) => {
@@ -782,7 +791,7 @@ async function saveShortcutSettings() {
     setAcc('stop', stopKey, null);
     setAcc('pause', pauseKey, null);
     setAcc('record_stop', recStopKey, 'F9');
-    setAcc('overlay', overlayKey, 'F8');
+    setAcc('overlay', overlayKey, null);
     const failed = await _applyGlobalShortcuts();
     const bad = invalid.concat(failed.filter(a => ['stop', 'pause', 'record_stop', 'overlay'].includes(a))
       .map(a => _globalShortcutMap[a]));

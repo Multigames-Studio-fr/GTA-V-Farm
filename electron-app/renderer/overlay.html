@@ -233,7 +233,7 @@
         <button type="button" class="corner" data-corner="bl" aria-label="Coin bas gauche">↙</button>
         <button type="button" class="corner" data-corner="br" aria-label="Coin bas droit">↘</button>
       </div>
-      <div class="s-hint">Raccourci : <b id="s-key">F8</b> afficher / masquer</div>
+      <div class="s-hint">Raccourci : <b id="s-key">aucun</b> afficher / masquer</div>
       <div class="s-hint" id="s-ct-hint" hidden>Clic à travers : seule la barre du haut reste cliquable.</div>
       <div class="s-foot">
         <button type="button" id="btn-focus-main">Ouvrir l'app</button>
@@ -477,7 +477,7 @@ function applyShortcutLabels(d) {
   if (!d) return;
   if (d.stop)    $('k-stop').textContent  = d.stop;
   if (d.pause)   $('k-pause').textContent = d.pause;
-  if (d.overlay) $('s-key').textContent   = d.overlay;
+  if ('overlay' in d) $('s-key').textContent = d.overlay || 'aucun';
 }
 async function loadShortcuts() {
   try { const r = await window.overlay.getShortcuts(); if (r && r.ok) applyShortcutLabels(r); } catch (_) {}
@@ -652,7 +652,7 @@ async function loadSettings() {
       S.locked = !!r.locked;
       S.clickThrough = !!r.clickThrough;
       S.sections = Object.assign({ meal: true, macros: true, stats: true }, r.sections || {});
-      if (r.shortcut) $('s-key').textContent = r.shortcut;
+      $('s-key').textContent = r.shortcut || 'aucun';
     }
   } catch (_) {}
   applySettingsUI();

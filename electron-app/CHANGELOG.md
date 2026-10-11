@@ -7,7 +7,7 @@
 - **Statistiques de session** : durée, cycles, repas, erreurs, raisons d'arrêt — export CSV et résumé Discord (manuel ou à la fermeture)
 - **Alertes Discord ciblées** : FiveM fermé, erreurs en série, échec Auto Bouffe — avec capture du jeu et mention, jamais perdues par la limite d'envoi
 - **Onglet Notifications** : chaque utilisateur configure son propre webhook Discord
-- **Overlay en jeu** : léger et transparent, déplaçable, réductible en pastille, opacité réglable, clic à travers, raccourci F8
+- **Overlay en jeu** : léger et transparent, déplaçable, réductible en pastille, opacité réglable, clic à travers, raccourci au choix (aucun par défaut)
 - **Quoi de neuf** : cette fenêtre s'affiche après chaque mise à jour (rouvrable depuis Paramètres › Système)
 
 ### Fixed

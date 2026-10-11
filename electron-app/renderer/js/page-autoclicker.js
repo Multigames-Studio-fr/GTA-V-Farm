@@ -323,6 +323,10 @@ async function _acpCaptureHandler(e) {
     _acpRejectHotkey(fieldId, el, prev, `${acc.error} — raccourci inchangé (${prev}).`);
     return;
   }
+  if (/(^|\+)F8$/i.test(acc)) { // F8 = FiveM console — never bound
+    _acpRejectHotkey(fieldId, el, prev, `F8 est réservée à la console FiveM — raccourci inchangé (${prev}).`);
+    return;
+  }
   el.value       = acc;
   el.style.color = '';
   _acpHotkeys[fieldId] = acc;

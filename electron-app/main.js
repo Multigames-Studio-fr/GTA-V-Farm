@@ -1044,8 +1044,15 @@ function _overlaySettings(s) {
       macros: sec.macros !== false,
       stats:  sec.stats  !== false,
     },
-    shortcut: s.shortcutOverlay || 'F8',
+    shortcut: _overlayShortcut(s),
   };
+}
+
+// No default overlay hotkey — F8 opens FiveM's console, so it is never used
+// (a stored 'F8' from v2.6.0 is treated as unset).
+function _overlayShortcut(s) {
+  const k = (s && s.shortcutOverlay) || '';
+  return k.toUpperCase() === 'F8' ? '' : k;
 }
 
 function _applyOverlayWindowSettings(os) {
@@ -1259,8 +1266,8 @@ ipcMain.on('overlay:pause-all', async () => {
 ipcMain.handle('overlay:get-shortcuts', () => {
   try {
     const s = readSettings();
-    return { ok: true, stop: s.shortcutStop || '', pause: s.shortcutPause || '', overlay: s.shortcutOverlay || 'F8' };
-  } catch (_) { return { ok: false, stop: '', pause: '', overlay: 'F8' }; }
+    return { ok: true, stop: s.shortcutStop || '', pause: s.shortcutPause || '', overlay: _overlayShortcut(s) };
+  } catch (_) { return { ok: false, stop: '', pause: '', overlay: '' }; }
 });
 
 ipcMain.on('overlay:macro-start', async (_, { name } = {}) => {
@@ -1510,7 +1517,7 @@ ipcMain.handle('settings:write', (_evt, data) => {
       _sendToOverlay('overlay:shortcuts-updated', {
         stop:    data.shortcutStop    || '',
         pause:   data.shortcutPause   || '',
-        overlay: data.shortcutOverlay || 'F8',
+        overlay: _overlayShortcut(data),
       });
     }
     return { ok: true };
