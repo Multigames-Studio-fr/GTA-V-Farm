@@ -362,9 +362,13 @@ async function _abfDetectState(debug) {
     if (leftRaw === null || rightRaw === null) return 'unknown';
     const ownVisible   = leftRaw.toLowerCase().includes('inventaire');
     const thirdVisible = !_abfNoTitleDetected(rightRaw);
+    // A 3rd panel never shows without our own inventory next to it — with the
+    // menu closed the right crop is just game scenery, which the model still
+    // "reads" (e.g. "#251428"). Trusting the right side alone reported the
+    // closed menu as 'third' and cancelled the end-of-cycle trunk reopen.
+    if (!ownVisible)  return 'closed';
     if (thirdVisible) return 'third';
-    if (ownVisible)   return 'own';
-    return 'closed';
+    return 'own';
   } catch (e) {
     appendLog('WARNING', 'Auto Bouffe IA erreur: ' + (e.message || e));
     return 'unknown';
