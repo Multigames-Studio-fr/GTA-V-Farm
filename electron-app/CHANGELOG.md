@@ -1,5 +1,13 @@
 # Changelog
 
+## [2.6.4] – 2026-10-12
+
+### Fixed
+- **Auto Bouffe – coffre jamais rouvert** : une fois l'inventaire fermé, le décor du jeu était parfois pris pour un panneau tiers, la fermeture paraissait ratée et la réouverture du coffre était annulée. Le panneau tiers n'est désormais reconnu que si l'inventaire est aussi visible — le cycle complet (fermer le coffre → manger → fermer → rouvrir le coffre) va maintenant jusqu'au bout
+
+---
+
+
 ## [2.6.3] – 2026-10-12
 
 ### Fixed
