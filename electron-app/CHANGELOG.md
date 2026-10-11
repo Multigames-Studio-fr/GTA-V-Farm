@@ -1,5 +1,12 @@
 # Changelog
 
+## [2.6.3] – 2026-10-12
+
+### Fixed
+- **Auto Bouffe – réouverture du coffre** : en fin de cycle, le coffre/véhicule rouvert est maintenant vérifié — le cycle ne se termine en succès que si le panneau tiers est bien revu à l'écran. Si seul l'inventaire s'ouvre, il est refermé et la touche coffre réessayée ; un coffre lent à s'ouvrir n'est plus refermé par un second appui trop rapide
+
+---
+
 ## [2.6.2] – 2026-10-11
 
 ### Fixed
