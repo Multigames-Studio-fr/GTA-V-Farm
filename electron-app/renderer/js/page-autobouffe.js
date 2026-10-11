@@ -556,23 +556,43 @@ async function _abfRunCycleInner(wait) {
       appendLog('WARNING', 'Auto Bouffe: panneau tiers refermé mais touche coffre non configurée — pas de réouverture.');
     } else {
       // Verified + retried: the inventory close animation can still be
-      // running when the first tap lands, and the game just drops it. Only
-      // retry on a confirmed 'closed' — on 'unknown' (AI failure) a second
-      // tap could just as well toggle a trunk that did open back shut.
+      // running when the first tap lands, and the game just drops it. The
+      // cycle only ends successfully once the 3rd panel is CONFIRMED back
+      // ('third') — 'own' alone means the trunk key opened just our own
+      // inventory (too far from the vehicle, key dropped mid-animation…), so
+      // it is closed again and the trunk key retried. Never retried on
+      // 'unknown' (AI failure): a second tap could just as well toggle a
+      // trunk that did open back shut.
       for (let i = 0; i < _ABF_MAX_CLOSE_RETRIES; i++) {
         appendLog('INFO', `Auto Bouffe: réouverture du coffre/véhicule (tentative ${i + 1}/${_ABF_MAX_CLOSE_RETRIES})…`);
         await _abfKeyTap(trunkKey);
         if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
         state = await _abfDetectStateLogged();
-        if (state !== 'closed') break;
-        if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+        if (state === 'closed') {
+          // Trunk opening can be slower than the inventory — look once more
+          // before re-tapping, or the retry would shut a trunk still opening.
+          if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+          state = await _abfDetectStateLogged();
+        }
+        if (state === 'third' || state === 'unknown') break;
+        if (state === 'own') {
+          appendLog('INFO', 'Auto Bouffe: inventaire seul ouvert au lieu du coffre — fermeture puis nouvel essai…');
+          await _abfKeyTap(invKey);
+          if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+          state = await _abfDetectStateLogged();
+          if (state !== 'closed') break; // can't get back to a clean closed state — stop pressing keys
+        }
       }
-      if (state === 'closed') {
-        appendLog('WARNING', `Auto Bouffe: le coffre ne s'est pas rouvert avec la touche "${trunkKey}" — re-capture la touche dans le champ "Touche coffre/véhicule".`);
+      if (state === 'third') {
+        appendLog('INFO', 'Auto Bouffe: panneau tiers confirmé — coffre rouvert.');
+        _abfRecord('trunk', outcome);
+      } else {
+        const why = state === 'unknown' ? 'état indéterminé (IA) après réouverture'
+                  : state === 'own'     ? 'seul l\'inventaire est ouvert, pas le coffre'
+                  : `le coffre ne s'est pas rouvert avec la touche "${trunkKey}" — re-capture la touche dans le champ "Touche coffre/véhicule"`;
+        appendLog('WARNING', `Auto Bouffe: panneau tiers non confirmé — ${why}.`);
         outcome += ' — coffre non rouvert';
         _abfRecord('trunkFail', outcome);
-      } else {
-        _abfRecord('trunk', outcome);
       }
     }
   }
