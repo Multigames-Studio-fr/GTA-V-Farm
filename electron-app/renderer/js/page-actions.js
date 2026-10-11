@@ -191,7 +191,7 @@ function getActTestObj() {
   const gb = id => { const el = document.getElementById(id); return el ? el.checked : false; };
   const obj = { type };
   if (g('at-key'))       obj.key       = g('at-key');
-  if (g('at-keys'))      obj.keys      = g('at-keys');
+  if (g('at-keys'))      obj.keys      = g('at-keys').split('+').map(k => k.trim()).filter(Boolean);
   if (gn('at-dur'))      obj.duration  = gn('at-dur');
   if (gn('at-count'))    obj.count     = gn('at-count');
   if (gb('at-direct'))   obj.use_direct = true;

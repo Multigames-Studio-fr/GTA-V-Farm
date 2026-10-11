@@ -93,7 +93,13 @@ _VK_MAP: dict[str, int] = {
 }
 
 def _key_to_vk(key: str) -> int | None:
-    return _VK_MAP.get(key.lower())
+    vk = _VK_MAP.get(key.lower())
+    if vk is None and len(key) == 1:
+        # Ponctuation/accents absents de la table : VK selon la disposition active
+        res = ctypes.windll.user32.VkKeyScanW(ctypes.c_wchar(key))
+        if res != -1 and (res & 0xFF) != 0xFF:
+            vk = res & 0xFF
+    return vk
 
 
 # ── Dispatch principal ─────────────────────────────────────────────────────────
@@ -155,6 +161,11 @@ def eval_condition(cond: dict) -> bool:
         if t == 'always':               return True
         if t == 'never':                return False
 
+    except _TemplateUnavailable as e:
+        # Template absent/illisible/trop grand : ni template_match ni
+        # template_not_found ne doivent être vrais. Logué une seule fois par
+        # message pour ne pas inonder les logs à chaque itération.
+        _warn_once(f'Condition [{t}] : {e}')
     except Exception as e:
         import logging
         logging.getLogger('engine').warning(f'Condition [{t}] erreur : {e}')
@@ -322,6 +333,24 @@ _template_cache: dict = {}
 _template_cache_lock = threading.Lock()
 
 
+class _TemplateUnavailable(Exception):
+    """Template inutilisable (fichier absent/illisible, plus grand que la région).
+    Distinct de « non trouvé » : les deux polarités doivent s'évaluer à False."""
+
+
+_warned_once: set = set()
+_warned_once_lock = threading.Lock()
+
+
+def _warn_once(msg: str) -> None:
+    with _warned_once_lock:
+        if msg in _warned_once:
+            return
+        _warned_once.add(msg)
+    import logging
+    logging.getLogger('engine').warning(msg)
+
+
 def _load_template(path: str):
     """Charge et cache un template cv2 depuis le disque (une seule fois par path)."""
     with _template_cache_lock:
@@ -343,19 +372,23 @@ def _template_match(cond: dict) -> bool:
     """
     True si le template est trouvé dans la région avec un score ≥ threshold.
     Paramètres : x, y, w, h, template_path, threshold (défaut 0.85)
+    Lève _TemplateUnavailable si le template est inutilisable (≠ non trouvé).
     """
     tmpl_path = cond.get('template_path', '')
     if not os.path.exists(tmpl_path):
-        return False
+        raise _TemplateUnavailable(f'template introuvable : {tmpl_path!r}')
     tmpl = _load_template(tmpl_path)
     if tmpl is None:
-        return False
+        raise _TemplateUnavailable(f'template illisible : {tmpl_path!r}')
     x, y, w, h = _get_region(cond)
     scene = capture_region(x, y, w, h)
     sg = cv2.cvtColor(scene, cv2.COLOR_BGR2GRAY)
     tg = cv2.cvtColor(tmpl,  cv2.COLOR_BGR2GRAY)
     if tg.shape[0] > sg.shape[0] or tg.shape[1] > sg.shape[1]:
-        return False
+        raise _TemplateUnavailable(
+            f'template {tmpl_path!r} ({tg.shape[1]}x{tg.shape[0]}) plus grand '
+            f'que la région ({sg.shape[1]}x{sg.shape[0]})'
+        )
     res = cv2.matchTemplate(sg, tg, cv2.TM_CCOEFF_NORMED)
     _, max_val, _, _ = cv2.minMaxLoc(res)
     return max_val >= cond.get('threshold', 0.85)

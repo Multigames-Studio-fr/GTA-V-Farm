@@ -2,6 +2,8 @@
 let _abfRunning  = false;
 let _abfBound    = false;      // guard against duplicate event listener registration
 let _abfCapturing = null;      // { el, fieldId } while waiting for key press
+let abfNextCycleAt = null;     // timestamp ms of the next scheduled cycle (read by the dashboard), null when stopped
+let abfCycleIntervalMs = 0;     // interval (ms) used to schedule abfNextCycleAt — read by the overlay feed (meal progress)
 
 // Incremented on every start. _abfIntervalLoop captures its value and bails out
 // as soon as it no longer matches, so a loop left over from a previous run can
@@ -107,6 +109,7 @@ function startAutoBouffe() {
   document.getElementById('abf-btn-stop').disabled  = false;
   document.getElementById('abf-status').textContent = '🟢 En cours…';
   _abfNotifyWebhook('autobouffe_start');
+  _abfPushSnapshot();
   _abfIntervalLoop(++_abfLoopGen);
 }
 
@@ -114,22 +117,23 @@ function stopAutoBouffe() {
   _abfRunning = false;
   _abfLoopGen++;      // invalidate any loop still in flight
   _abfCancelWaits();  // wake it now instead of up to `intervalMs` from now
+  abfNextCycleAt = null;
   document.getElementById('abf-btn-start').disabled = false;
   document.getElementById('abf-btn-stop').disabled  = true;
   document.getElementById('abf-status').textContent = 'Arrêté';
   _abfNotifyWebhook('autobouffe_stop');
+  _abfPushSnapshot();
 }
 
 /* Auto Bouffe never touches the engine's macro registry (pure JS interval
    loop, see _abfIntervalLoop) so unlike macros/Auto Clicker it never goes
    through macro_runner.py's webhook path — sent directly here instead.
-   Same debug-report attachment (screenshot/PC info/IP) as any other event,
-   since 'autobouffe_start'/'autobouffe_stop' are in _DEBUG_WEBHOOK_EVENTS. */
+   No early return on an empty user URL: the engine decides the routing (user
+   channel needs a URL, the dev debug channel only needs consent). */
 async function _abfNotifyWebhook(event) {
   try {
     const settings = await window.api.readSettings().catch(() => ({}));
-    if (!settings?.webhookUrl) return;
-    await window.api.setWebhook({ url: settings.webhookUrl, events: settings.webhookEvents }).catch(() => {});
+    await window.api.setWebhook(buildWebhookConfig(settings)).catch(() => {});
     await window.api.sendWebhook({ event, data: { name: 'Auto Bouffe' } });
   } catch (_) {}
 }
@@ -393,7 +397,43 @@ function _abfPlainWait(ms) {
    mid-cycle (caller should stop immediately, outcome is unset); ok is true
    otherwise, with outcome a short human-readable summary of what happened
    (surfaced by _abfForceCycle next to its button). ── */
+function _abfPushSnapshot() {
+  try { if (typeof sessionStats !== 'undefined') sessionStats.pushSnapshot(); } catch (e) { /* ignore */ }
+}
+
+/* Session stats + failure collection. Failures of one cycle (meal and/or
+   trunk) are flushed as ONE autobouffe_fail alert by _abfRunCycle. Never throws. */
+let _abfCycleFails = [];
+function _abfRecord(kind, outcome) {
+  try {
+    if (typeof sessionStats === 'undefined') return;
+    sessionStats.recordAbf(kind);
+    if (kind === 'mealFail' || kind === 'trunkFail') _abfCycleFails.push(outcome);
+  } catch (e) { /* stats must never break a cycle */ }
+}
+
+/* Wrapper: one alert per failing cycle + snapshot push at the end of every cycle. */
 async function _abfRunCycle(wait) {
+  _abfCycleFails = [];
+  try {
+    return await _abfRunCycleInner(wait);
+  } finally {
+    const fails = _abfCycleFails.filter((o, i, a) => !a.some((p, j) => j > i && String(p).includes(o)));
+    _abfCycleFails = [];
+    if (fails.length) {
+      try {
+        const p = window.api.sendWebhook({ event: 'autobouffe_fail', data: { outcome: fails.join(' ; '), message: 'Cycle Auto Bouffe en échec' } });
+        if (p && p.catch) p.catch(() => {});
+      } catch (e) { /* ignore */ }
+      try {
+        if (typeof overlayFeed !== 'undefined') overlayFeed.alert('Auto Bouffe', 'Cycle en échec — ' + fails.join(' ; '));
+      } catch (e) { /* ignore */ }
+    }
+    _abfPushSnapshot();
+  }
+}
+
+async function _abfRunCycleInner(wait) {
   const invKey = document.getElementById('abf-key-inventory').value;
   const trunkKey = document.getElementById('abf-key-trunk').value;
   let hadThirdPanel = false; // was a trunk/vehicle/crate open before we forced it closed to eat?
@@ -413,6 +453,7 @@ async function _abfRunCycle(wait) {
     state = await _abfDetectStateLogged();
     if (state === 'closed') {
       appendLog('WARNING', 'Auto Bouffe: impossible de confirmer l\'ouverture de l\'inventaire — cycle passé.');
+      _abfRecord('mealFail', 'inventaire jamais confirmé ouvert');
       return { ok: true, outcome: 'inventaire jamais confirmé ouvert' };
     }
   }
@@ -437,6 +478,7 @@ async function _abfRunCycle(wait) {
   if (state === 'third') {
     appendLog('WARNING', 'Auto Bouffe: panneau tiers toujours ouvert après plusieurs tentatives — cycle passé.');
     outcome = 'panneau tiers toujours ouvert — repas sauté';
+    _abfRecord('mealFail', outcome);
   } else if (state === 'unknown') {
     // Kept distinct from 'closed': the two used to share one message that
     // blamed the inventory, hiding the real cause (no API key, HTTP error,
@@ -444,9 +486,11 @@ async function _abfRunCycle(wait) {
     // actual reason just above this line.
     appendLog('WARNING', 'Auto Bouffe: état de l\'inventaire indéterminé (l\'IA n\'a pas répondu) — cycle passé, voir l\'erreur ci-dessus.');
     outcome = 'état indéterminé — repas sauté';
+    _abfRecord('mealFail', outcome);
   } else if (state !== 'own') {
     appendLog('WARNING', 'Auto Bouffe: inventaire fermé après les tentatives de réouverture — cycle passé.');
     outcome = 'inventaire refermé avant de pouvoir manger';
+    _abfRecord('mealFail', outcome);
   } else {
     // 3. Eat, then drink — each repeated abf-*-clicks times (configurable,
     //    e.g. eating 2+ items per cycle), one _ABF_UI_DELAY_MS pause
@@ -471,6 +515,7 @@ async function _abfRunCycle(wait) {
       if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
     }
     outcome = `mangé ${eatClicks}×, bu ${drinkClicks}×`;
+    _abfRecord('meal', outcome);
   }
 
   // 4. Close the inventory — ONLY when something is actually open. The key is
@@ -510,9 +555,25 @@ async function _abfRunCycle(wait) {
     } else if (!trunkKey) {
       appendLog('WARNING', 'Auto Bouffe: panneau tiers refermé mais touche coffre non configurée — pas de réouverture.');
     } else {
-      appendLog('INFO', 'Auto Bouffe: réouverture du coffre/véhicule…');
-      await _abfKeyTap(trunkKey);
-      if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+      // Verified + retried: the inventory close animation can still be
+      // running when the first tap lands, and the game just drops it. Only
+      // retry on a confirmed 'closed' — on 'unknown' (AI failure) a second
+      // tap could just as well toggle a trunk that did open back shut.
+      for (let i = 0; i < _ABF_MAX_CLOSE_RETRIES; i++) {
+        appendLog('INFO', `Auto Bouffe: réouverture du coffre/véhicule (tentative ${i + 1}/${_ABF_MAX_CLOSE_RETRIES})…`);
+        await _abfKeyTap(trunkKey);
+        if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+        state = await _abfDetectStateLogged();
+        if (state !== 'closed') break;
+        if (!(await wait(_ABF_UI_DELAY_MS))) return { ok: false };
+      }
+      if (state === 'closed') {
+        appendLog('WARNING', `Auto Bouffe: le coffre ne s'est pas rouvert avec la touche "${trunkKey}" — re-capture la touche dans le champ "Touche coffre/véhicule".`);
+        outcome += ' — coffre non rouvert';
+        _abfRecord('trunkFail', outcome);
+      } else {
+        _abfRecord('trunk', outcome);
+      }
     }
   }
   return { ok: true, outcome: outcome + (closeUncertain ? ' (fermeture incertaine)' : '') };
@@ -541,9 +602,13 @@ async function _abfIntervalLoop(gen) {
     const s = parseInt(document.getElementById('abf-s').value) || 0;
     const intervalMs = Math.max(_ABF_MIN_INTERVAL_S, h * 3600 + m * 60 + s) * 1000;
 
+    abfNextCycleAt = null; // cycle running now — dashboard shows "Cycle en cours…"
     const result = await _abfRunCycleExclusive(_abfWait);
     if (!result.ok || gen !== _abfLoopGen) return;
 
+    if (!_abfRunning || gen !== _abfLoopGen) return; // stopped meanwhile — don't resurrect a next-meal time
+    abfCycleIntervalMs = intervalMs;
+    abfNextCycleAt = Date.now() + intervalMs;
     appendLog('INFO', `Auto Bouffe: cycle terminé (${result.outcome}) — ` +
       `prochain dans ${Math.round(intervalMs / 1000)}s.`);
     if (!(await _abfWait(intervalMs))) return;
@@ -694,21 +759,11 @@ function _abfCapKey(el, fieldId) {
   document.addEventListener('keydown', _abfCaptureHandler, true);
 }
 
-// pydirectinput's KEYBOARD_MAPPING is entirely lowercase and doesn't share
-// the DOM's special-key spelling — e.g. keyDown('Tab') or keyDown('Control')
-// silently does nothing (no exception, just an unmapped-key no-op), so a raw
-// captured e.key needs translating or the key press is completely inert.
-const _ABF_DOM_KEY_MAP = {
-  control: 'ctrl', arrowup: 'up', arrowdown: 'down', arrowleft: 'left', arrowright: 'right',
-};
-function _abfNormalizeKey(domKey) {
-  const lower = domKey.toLowerCase();
-  return _ABF_DOM_KEY_MAP[lower] || lower;
-}
-
+// Keys are sent with pydirectinput (QWERTY-position scancodes) — the shared
+// keyNameFromEvent() (utils.js) derives the name from the physical key.
 function _abfCaptureHandler(e) {
   if (!_abfCapturing) return;
-  const key = _abfNormalizeKey(e.key);
+  const key = keyNameFromEvent(e);
   e.preventDefault();
   e.stopPropagation();
   _abfCapturing.el.value       = key;

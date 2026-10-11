@@ -37,6 +37,7 @@
       "app.config.json",
       "config_parser.py",
       "renderer/**/*",
+      "CHANGELOG.md",
       "package.json"
     ],
     "asarUnpack": [

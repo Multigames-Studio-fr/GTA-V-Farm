@@ -15,6 +15,69 @@ except ImportError:
 
 
 _DRAG_THRESHOLD = 5  # pixels — en dessous = clic simple, au-dessus = drag
+_HOLD_THRESHOLD = 0.3  # s — une touche maintenue plus longtemps est rejouée en key_hold
+
+# ── Noms de touches pydirectinput ─────────────────────────────────────────────
+# Le replay (key_tap/key_hold/key_combo avec use_direct) passe par pydirectinput,
+# qui envoie des scancodes matériels nommés en QWERTY ('a' → 0x1E) et ignore
+# silencieusement tout nom inconnu. Enregistrer key.char (caractère traduit par
+# la disposition : 'a' sur la touche Q d'un AZERTY, 'é', '&', '\x03' pour
+# Ctrl+C) ou les noms pynput (ctrl_l, page_up…) donnait donc des touches fausses
+# ou inertes au replay. On dérive ici le nom de la position physique.
+
+# Key pynput (touches spéciales) → nom pydirectinput
+_PYNPUT_SPECIAL: dict[str, str] = {
+    'alt': 'alt', 'alt_l': 'altleft', 'alt_r': 'altright', 'alt_gr': 'altright',
+    'backspace': 'backspace', 'caps_lock': 'capslock',
+    'cmd': 'winleft', 'cmd_l': 'winleft', 'cmd_r': 'winright',
+    'ctrl': 'ctrlleft', 'ctrl_l': 'ctrlleft', 'ctrl_r': 'ctrlright',
+    'shift': 'shiftleft', 'shift_l': 'shiftleft', 'shift_r': 'shiftright',
+    'delete': 'delete', 'insert': 'insert', 'home': 'home', 'end': 'end',
+    'page_up': 'pageup', 'page_down': 'pagedown',
+    'up': 'up', 'down': 'down', 'left': 'left', 'right': 'right',
+    'enter': 'enter', 'esc': 'esc', 'space': 'space', 'tab': 'tab',
+    'menu': 'apps', 'num_lock': 'numlock', 'scroll_lock': 'scrolllock',
+    'pause': 'pause', 'print_screen': 'printscreen',
+    **{f'f{n}': f'f{n}' for n in range(1, 13)},
+}
+
+_MODIFIERS = frozenset({
+    'ctrl', 'ctrlleft', 'ctrlright', 'shift', 'shiftleft', 'shiftright',
+    'alt', 'altleft', 'altright', 'win', 'winleft', 'winright',
+})
+
+# Scancode (set 1, non étendu) → nom pydirectinput, pour les touches « caractère »
+_SCAN_TO_NAME: dict[int, str] = {}
+try:
+    import pydirectinput as _pdi
+    for _n in list('abcdefghijklmnopqrstuvwxyz0123456789') + \
+              ['`', '-', '=', '[', ']', '\\', ';', "'", ',', '.', '/',
+               'multiply', 'subtract', 'add', 'decimal']:
+        _sc = _pdi.KEYBOARD_MAPPING.get(_n)
+        if _sc is not None and _sc < 0x100:
+            _SCAN_TO_NAME.setdefault(_sc, _n)
+except Exception:  # pydirectinput absent : table de secours (QWERTY set 1)
+    _row = {0x02: '1234567890-=', 0x10: 'qwertyuiop[]', 0x1E: "asdfghjkl;'`",
+            0x2B: '\\zxcvbnm,./'}
+    for _base, _chars in _row.items():
+        for _i, _c in enumerate(_chars):
+            _SCAN_TO_NAME.setdefault(_base + _i, _c)
+    _SCAN_TO_NAME.update({0x37: 'multiply', 0x4A: 'subtract', 0x4E: 'add', 0x53: 'decimal'})
+
+# VK pavé numérique → nom pydirectinput (pas de noms « num0..9 » côté
+# pydirectinput : on retombe sur les chiffres de la rangée du haut).
+_NUMPAD_VK: dict[int, str] = {
+    **{0x60 + d: str(d) for d in range(10)},
+    0x6A: 'multiply', 0x6B: 'add', 0x6D: 'subtract', 0x6E: 'decimal', 0x6F: 'divide',
+}
+
+
+def _vk_to_scan(vk: int) -> int:
+    try:
+        import ctypes
+        return int(ctypes.windll.user32.MapVirtualKeyW(vk, 0))  # MAPVK_VK_TO_VSC
+    except Exception:
+        return 0
 
 
 class MacroRecorder:
@@ -34,6 +97,11 @@ class MacroRecorder:
         # drag tracking
         self._drag_start: dict | None = None   # {x, y, button, time}
         self._current_pos: tuple[int, int] = (0, 0)
+        # keyboard state
+        self._held: dict[str, float] = {}      # touche → instant du keydown
+        self._mods_down: list[str] = []         # modificateurs enfoncés (ordre)
+        self._mods_used: set[str] = set()       # modificateurs déjà combinés
+        self._pending: dict[str, dict] = {}     # touche → action émise au keydown
 
     def start(self):
         if not _PYNPUT_AVAILABLE:
@@ -42,6 +110,8 @@ class MacroRecorder:
             return
         self._recording = True
         self._actions = []
+        self._held.clear(); self._mods_down.clear()
+        self._mods_used.clear(); self._pending.clear()
         self._start_time = time.time()
         self._last_time = self._start_time
 
@@ -108,11 +178,22 @@ class MacroRecorder:
 
     # ── Keyboard ──────────────────────────────────────────────
     def _key_name(self, key) -> str | None:
-        """Convert pynput key to string name."""
-        if hasattr(key, 'char') and key.char:
-            return key.char
-        if hasattr(key, 'name') and key.name:
-            return key.name
+        """Nom pydirectinput de la touche *physique* (indépendant de la disposition)."""
+        if isinstance(key, keyboard.Key):
+            return _PYNPUT_SPECIAL.get(key.name)  # media/f13+ → None (ignorées)
+        vk = getattr(key, 'vk', None)
+        if vk is not None:
+            if vk in _NUMPAD_VK:
+                return _NUMPAD_VK[vk]
+            scan = getattr(key, '_scan', None) or _vk_to_scan(vk)
+            name = _SCAN_TO_NAME.get(scan & 0xFF) if scan else None
+            if name:
+                return name
+        # Dernier recours (KeyCode synthétique sans vk) : caractère ASCII
+        # imprimable seulement — jamais un caractère de contrôle type '\x03'.
+        ch = getattr(key, 'char', None)
+        if ch and len(ch) == 1 and ch.lower() in _SCAN_TO_NAME.values():
+            return ch.lower()
         return None
 
     def _on_key_press(self, key):
@@ -121,13 +202,74 @@ class MacroRecorder:
         name = self._key_name(key)
         if not name:
             return
+        now = time.time()
+        with self._lock:
+            # Auto-répétition Windows : keydown répétés sans keyup → ignorés
+            if name in self._held:
+                return
+            self._held[name] = now
+            if name in _MODIFIERS:
+                # Différé : soit combiné à la prochaine touche (key_combo),
+                # soit rejoué seul au relâchement s'il n'a servi à rien.
+                self._mods_down.append(name)
+                return
+            mods = list(self._mods_down)
+            self._mods_used.update(mods)
         dt = self._elapsed()
         if dt > 0.05:
             self._add({'type': 'wait', 'duration': dt})
-        self._add({'type': 'key_tap', 'key': name, 'duration': 0.05, 'count': 1, 'use_direct': True})
+        if mods:
+            action = {'type': 'key_combo', 'keys': mods + [name],
+                      'duration': 0.05, 'use_direct': True}
+        else:
+            action = {'type': 'key_tap', 'key': name, 'duration': 0.05,
+                      'count': 1, 'use_direct': True}
+        self._add(action)
+        with self._lock:
+            self._pending[name] = action
 
     def _on_key_release(self, key):
-        pass  # We record taps, not hold/release pairs
+        if not self._recording:
+            return
+        name = self._key_name(key)
+        if not name:
+            return
+        now = time.time()
+        with self._lock:
+            t0 = self._held.pop(name, None)
+            if t0 is None:
+                return
+            held = round(now - t0, 3)
+            if name in _MODIFIERS:
+                if name in self._mods_down:
+                    self._mods_down.remove(name)
+                if name in self._mods_used:
+                    self._mods_used.discard(name)
+                    return
+                # Modificateur pressé/relâché seul → tap (ou hold s'il a duré)
+                wait = round(t0 - self._last_time, 3)
+                self._last_time = now
+                if wait > 0.05:
+                    self._add({'type': 'wait', 'duration': wait})
+                if held > _HOLD_THRESHOLD:
+                    self._add({'type': 'key_hold', 'key': name, 'duration': held,
+                               'use_direct': True})
+                else:
+                    self._add({'type': 'key_tap', 'key': name, 'duration': 0.05,
+                               'count': 1, 'use_direct': True})
+                return
+            action = self._pending.pop(name, None)
+            # Touche maintenue longtemps et rien enregistré entre-temps :
+            # le tap devient un key_hold (ou un combo maintenu) de même durée.
+            if (held > _HOLD_THRESHOLD and action is not None
+                    and self._actions and self._actions[-1] is action):
+                if action['type'] == 'key_tap':
+                    new = {'type': 'key_hold', 'key': name, 'duration': held,
+                           'use_direct': True}
+                else:
+                    new = dict(action, duration=held)
+                self._actions[-1] = new
+                self._last_time = now
 
     # ── Mouse ─────────────────────────────────────────────────
     def _flush_drag(self):

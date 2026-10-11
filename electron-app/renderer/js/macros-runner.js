@@ -30,9 +30,7 @@ async function runCurrentMacro() {
   try {
     await ensureEngine();
     const settings = await window.api.readSettings().catch(() => ({}));
-    if (settings && settings.webhookUrl) {
-      await window.api.setWebhook({ url: settings.webhookUrl });
-    }
+    await window.api.setWebhook(buildWebhookConfig(settings));
     await window.api.macroStart({ macro, macro_id: macro.name });
     renderDashboard();
     appendLog('INFO', 'Macro démarrée: ' + macro.name);
@@ -113,9 +111,7 @@ async function startMacro(idx) {
   try {
     await ensureEngine();
     const settings = await window.api.readSettings().catch(() => ({}));
-    if (settings && settings.webhookUrl) {
-      await window.api.setWebhook({ url: settings.webhookUrl });
-    }
+    await window.api.setWebhook(buildWebhookConfig(settings));
     await window.api.macroStart({ macro, macro_id: macro.name });
     runningMacros.add(macro.name);
     updateMacroRunButtons();

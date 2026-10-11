@@ -201,10 +201,13 @@ _HISTORY_PATH = os.path.join(
     'macro_history.json',
 )
 _HISTORY_MAX = 300  # entrées totales conservées, toutes macros confondues
+# Verrou dédié : l'I/O disque ne doit pas bloquer compteurs/variables/dead zones
+# (protégés par _lock), et history_get ne doit pas lire un fichier à moitié écrit.
+_history_lock = threading.Lock()
 
 def history_append(record: dict) -> None:
     """Best-effort : une erreur d'écriture ne doit jamais faire planter le runner."""
-    with _lock:
+    with _history_lock:
         try:
             data = []
             if os.path.exists(_HISTORY_PATH):
@@ -215,22 +218,26 @@ def history_append(record: dict) -> None:
             data.append(record)
             if len(data) > _HISTORY_MAX:
                 data = data[-_HISTORY_MAX:]
-            with open(_HISTORY_PATH, 'w', encoding='utf-8') as f:
+            # Écriture atomique : fichier temporaire puis os.replace
+            tmp_path = _HISTORY_PATH + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, _HISTORY_PATH)
         except Exception:
             pass
 
 def history_get(limit: int = 100) -> list:
-    try:
-        if not os.path.exists(_HISTORY_PATH):
+    with _history_lock:
+        try:
+            if not os.path.exists(_HISTORY_PATH):
+                return []
+            with open(_HISTORY_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return []
+            return data[-limit:][::-1]  # plus récent en premier
+        except Exception:
             return []
-        with open(_HISTORY_PATH, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if not isinstance(data, list):
-            return []
-        return data[-limit:][::-1]  # plus récent en premier
-    except Exception:
-        return []
 
 
 # ── Runner registry (partagé avec conditions.py, évite l'import lourd au démarrage) ──

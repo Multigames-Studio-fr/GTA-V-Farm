@@ -43,6 +43,8 @@ contextBridge.exposeInMainWorld('api', {
   // ── Webhook ───────────────────────────────────────────────
   setWebhook:  (p) => ipcRenderer.invoke('engine:set_webhook',  p),
   sendWebhook: (p) => ipcRenderer.invoke('engine:send_webhook', p),
+  setSessionSnapshot: (p) => ipcRenderer.invoke('engine:set_session_snapshot', p),
+  sessionShutdown: () => ipcRenderer.invoke('engine:session_shutdown', {}),
 
   // ── Recording ─────────────────────────────────────────────
   recordStart: () => ipcRenderer.invoke('engine:record_start'),
@@ -114,6 +116,12 @@ contextBridge.exposeInMainWorld('api', {
   hideOverlay:     ()  => ipcRenderer.invoke('overlay:hide'),
   toggleOverlay:   ()  => ipcRenderer.invoke('overlay:toggle'),
   onOverlayClosed: (cb) => ipcRenderer.on('overlay:closed', () => cb()),
+  overlayPush:     (d)  => ipcRenderer.send('overlay:data', d),        // session/meal/alert → overlay
+  onOverlayCommand:(cb) => ipcRenderer.on('overlay:command', (_, d) => cb(d)),
+  onEngineAlert:   (cb) => ipcRenderer.on('engine:alert', (_, d) => cb(d)),
+
+  // ── Quoi de neuf ──────────────────────────────────────────
+  getChangelog: () => ipcRenderer.invoke('app:changelog'),
 
   // ── Auto Clicker config (shared with overlay) ─────────────
   saveAcpConfig: (data) => ipcRenderer.invoke('acp:save-config', data),

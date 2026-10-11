@@ -24,4 +24,12 @@ contextBridge.exposeInMainWorld('overlay', {
   getShortcuts:         ()     => ipcRenderer.invoke('overlay:get-shortcuts'),
   pauseAll:             ()     => ipcRenderer.send('overlay:pause-all'),
   onShortcutsUpdated:   (cb)   => ipcRenderer.on('overlay:shortcuts-updated', (_, d) => cb(d)),
+  // Session / meal / alert feed (relayed from the main renderer every 2 s)
+  onData:               (cb)   => ipcRenderer.on('overlay:data', (_, d) => cb(d)),
+  // Overlay settings (opacity, lock, click-through, sections) + window placement
+  getSettings:          ()     => ipcRenderer.invoke('overlay:get-settings'),
+  setSettings:          (p)    => ipcRenderer.send('overlay:set-settings', p),
+  setIgnoreMouse:       (on)   => ipcRenderer.send('overlay:set-ignore-mouse', { on: !!on }),
+  snapCorner:           (c)    => ipcRenderer.send('overlay:snap', { corner: c }),
+  command:              (cmd)  => ipcRenderer.send('overlay:command', { cmd }),
 });

@@ -8,7 +8,7 @@ OUT (stdout): {"type": "response", "id": "uid", "ok": true/false, ...}
               {"type": "status",   "running": ["macro_id", ...]}
 """
 from __future__ import annotations
-import sys, os, json, threading, logging, urllib.request, time, gc
+import sys, os, re, json, threading, logging, urllib.request, time, gc
 from datetime import datetime, timezone
 
 # Piped stdout/stderr default to the console codepage (cp1252 on this
@@ -18,6 +18,10 @@ from datetime import datetime, timezone
 # response line is simply never written and the caller times out.
 sys.stdout.reconfigure(encoding='utf-8')
 sys.stderr.reconfigure(encoding='utf-8')
+# Same for stdin: Electron writes UTF-8, cp1252 decoding mangles accents and
+# raises UnicodeDecodeError on some bytes (0x81/0x8D...) inside the main
+# `for raw in sys.stdin` loop — outside any try, which killed the engine.
+sys.stdin.reconfigure(encoding='utf-8', errors='replace')
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -73,8 +77,29 @@ _send_lock = threading.Lock()
 def _send(obj: dict):
     with _send_lock:
         try:
-            sys.stdout.write(json.dumps(obj, ensure_ascii=False) + '\n')
+            line = json.dumps(obj, ensure_ascii=False)
+        except Exception:
+            # numpy scalars, objets non sérialisables... → 2e chance en str()
+            try:
+                line = json.dumps(obj, ensure_ascii=True, default=str)
+            except Exception as e:
+                line = None
+                if obj.get('type') == 'response' and obj.get('id'):
+                    # Toujours répondre — sinon le renderer attend indéfiniment
+                    line = json.dumps({'type': 'response', 'id': str(obj['id']), 'ok': False,
+                                       'error': f'Réponse non sérialisable: {type(e).__name__}'})
+        if line is None:
+            return
+        try:
+            sys.stdout.write(line + '\n')
             sys.stdout.flush()
+        except UnicodeEncodeError:
+            # surrogates isolés : ensure_ascii les échappe en \udXXX
+            try:
+                sys.stdout.write(json.dumps(obj, ensure_ascii=True, default=str) + '\n')
+                sys.stdout.flush()
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -105,16 +130,35 @@ _webhook_disabled      = False        # désactivé après trop d'échecs 403
 _webhook_events: set   = {
     'macro_start', 'macro_stop', 'macro_auto_stop', 'rule_triggered',
     'autoclicker_start', 'autoclicker_stop', 'autobouffe_start', 'autobouffe_stop',
+    'game_closed', 'macro_errors', 'autobouffe_fail', 'session_summary',
 }
+# Événements critiques : jamais jetés par le rate-limit (mis en file), mention
+# optionnelle, capture du jeu jointe.
+_CRITICAL_EVENTS = {'game_closed', 'macro_errors', 'autobouffe_fail'}
+_webhook_mention_id: str          = ''     # ID utilisateur Discord (chiffres) à mentionner
+_webhook_error_threshold: int     = 5      # erreurs macro avant alerte macro_errors
+_webhook_alert_screenshot: bool   = True   # capture du jeu jointe aux alertes critiques
+_webhook_session_on_exit: bool    = True   # résumé de session à la fermeture
 _WEBHOOK_MAX_FAILS     = 3            # désactiver après N échecs consécutifs
 _webhook_log           = logging.getLogger('engine')
 
-# Rapport debug (screenshot + infos PC, IP incluse) joint à TOUTE notification
-# (macro_start/stop, macro_auto_stop, rule_triggered, autoclicker_*,
-# autobouffe_*, test — sans exception dès que ce flag est actif). Activé par
-# défaut, mais totalement inerte tant que _webhook_url n'est pas configuré
-# par l'utilisateur (aucune URL en dur — voir _cmd_set_webhook).
-_webhook_debug_screenshot: bool = True
+# ── Canal debug développeur (séparé du webhook utilisateur) ───────────────────
+# Le rapport debug (screenshot + infos PC, IP, MAC, report.html) ne part JAMAIS
+# vers _webhook_url : uniquement vers _debug_webhook_url, et seulement si
+# l'utilisateur a consenti (_debug_consent). Rate-limit (2 s, drop) et
+# circuit-breaker propres, indépendants du canal utilisateur.
+_debug_webhook_url: str   = ''       # poussée par le renderer (set_webhook debug_url)
+_debug_consent: bool      = False    # faux tant que l'utilisateur n'a pas accepté
+_debug_lock               = threading.Lock()
+_debug_last_sent: float   = 0.0
+_debug_min_interval       = 2.0
+_debug_fail_count         = 0
+_debug_disabled           = False
+
+# ── Surveillance / instantané de session ──────────────────────────────────────
+_session_lock             = threading.Lock()
+_session_snapshot: dict   = {}       # poussé par le renderer (set_session_snapshot)
+_abf_running: bool        = False    # Auto Bouffe actif (poussé avec l'instantané)
 
 def _init_condition_registry():
     """
@@ -123,6 +167,17 @@ def _init_condition_registry():
     """
     from modules.engine import state
     state.set_runners_registry(_runners)
+
+def _release_sct():
+    """Libère l'instance mss per-thread du thread courant (threads jetables :
+    vlm_ask, webhook, exec_action de test) — sinon un DC GDI fuit par thread."""
+    sr = sys.modules.get('modules.engine.screen_reader')
+    if sr is None:
+        return  # jamais importé → aucune instance mss créée (évite d'importer cv2 pour rien)
+    try:
+        sr.release_thread_sct()
+    except Exception:
+        pass
 
 def _reply(req_id: str, ok: bool, **kw):
     _send({'type': 'response', 'id': req_id, 'ok': ok, **kw})
@@ -146,6 +201,28 @@ def _debug_write(msg: str) -> None:
         pass
 
 
+def _mask_secret(s: str) -> str:
+    """'ABCD-1234-…-WXYZ' → 'ABCD…WXYZ' (jamais la clé complète dans un rapport)."""
+    s = s or ''
+    if not s:
+        return ''
+    return s[:4] + '…' + s[-4:] if len(s) > 10 else '…'
+
+
+_RE_DISCORD_WEBHOOK = re.compile(r'https?://(?:\w+\.)?discord(?:app)?\.com/api/webhooks/\S+', re.I)
+_RE_API_KEY = re.compile(r'''(["']?api[_-]?key["']?\s*[:=]\s*["']?)[^"'\s,}]+''', re.I)
+
+
+def _redact_log_line(line: str) -> str:
+    """Masque clé de licence, URLs webhook Discord et valeurs api_key dans
+    une ligne de app.log avant de la joindre au rapport."""
+    if _license_key and len(_license_key) >= 4:
+        line = line.replace(_license_key, _mask_secret(_license_key))
+    line = _RE_DISCORD_WEBHOOK.sub('[webhook masqué]', line)
+    line = _RE_API_KEY.sub(r'\1[masqué]', line)
+    return line
+
+
 def _gather_debug_report() -> tuple[dict, bytes | None]:
     """
     Screenshot (tous écrans) + infos PC pour enrichir les rapports macro_start/
@@ -154,8 +231,8 @@ def _gather_debug_report() -> tuple[dict, bytes | None]:
     """
     info = {}
     png_bytes = None
-    # Cette fonction tourne dans le thread d'arrière-plan de _do_send (voir
-    # _send_webhook) — un thread frais qui n'a jamais initialisé COM. Sans ça,
+    # Cette fonction tourne dans un thread d'arrière-plan frais (voir
+    # _send_webhook / _send_debug_report) — un thread frais qui n'a jamais initialisé COM. Sans ça,
     # tout appel win32com.client (WMI : GPU, composants, USB, antivirus...)
     # lève silencieusement "CoInitialize has not been called", attrapé par les
     # except ci-dessous et donc invisible — d'où des champs matériel absents.
@@ -179,7 +256,7 @@ def _gather_debug_report() -> tuple[dict, bytes | None]:
             'os':            platform.platform(),
             'resolution':    f'{w}x{h}',
             'monitors':      len(get_all_monitors()),
-            'license':       _license_key or '(non définie)',
+            'license':       _mask_secret(_license_key) or '(non définie)',
             'app_version':   _app_version or '(inconnue)',
             'python':        platform.python_version(),
             'engine_uptime': f'{(time.time() - _engine_start_time) / 60:.1f} min',
@@ -498,7 +575,7 @@ def _generate_html_report(info: dict) -> bytes:
     Construit le rapport HTML (bytes, prêt à joindre au webhook) — page
     autonome (aucune dépendance externe hors la tuile de carte statique)
     reprenant machine/réseau/carte/licence/historique/logs. `info` doit venir
-    d'un appel à _gather_debug_report() déjà fait par l'appelant (_do_send) —
+    d'un appel à _gather_debug_report() déjà fait par l'appelant (_post_debug_webhook) —
     pas de second appel ici, ça doublerait la capture d'écran + les requêtes
     réseau (IP, géoloc) pour rien. Le screenshot n'est PAS ré-embarqué dedans :
     il part déjà comme pièce jointe séparée dans le même message Discord.
@@ -509,7 +586,7 @@ def _generate_html_report(info: dict) -> bytes:
     log_lines: list[str] = []
     try:
         with open(os.path.join(ROOT, 'app.log'), 'r', encoding='utf-8', errors='ignore') as f:
-            log_lines = f.readlines()[-200:]
+            log_lines = [_redact_log_line(l) for l in f.readlines()[-200:]]
     except Exception:
         pass
 
@@ -577,61 +654,356 @@ def _generate_html_report(info: dict) -> bytes:
         for h in history
     ) or '<tr><td colspan="5" class="empty">Aucun run terminé pour l\'instant</td></tr>'
 
-    log_html = _html.escape(''.join(log_lines)) or '(vide)'
+    def _log_cls(line: str) -> str:
+        u = line.upper()
+        if 'ERROR' in u or 'CRITICAL' in u or 'TRACEBACK' in u:
+            return 'l-err'
+        if 'WARN' in u:
+            return 'l-warn'
+        if 'DEBUG' in u:
+            return 'l-dbg'
+        return ''
+    log_html = ''.join(
+        f'<div class="{_log_cls(l)}">{_html.escape(l.rstrip())}</div>' for l in log_lines
+    ) or '<div class="l-dbg">(vide)</div>'
+    log_err_count = sum(1 for l in log_lines if _log_cls(l) == 'l-err')
+    log_warn_count = sum(1 for l in log_lines if _log_cls(l) == 'l-warn')
 
     generated_at = datetime.now().strftime('%d/%m/%Y à %H:%M:%S')
 
+    fivem_txt = str(info.get('fivem_status') or '')
+    fivem_on = 'en cours' in fivem_txt
+    lic_ok = 'valide' in str(lic_status).lower() or 'valid' in str(lic_status).lower()
+    run_errors = sum(int(h.get('errors') or 0) for h in history)
+
+    def chip(label: str, value, tone: str = '') -> str:
+        return f'<span class="chip {tone}"><span class="chip-dot"></span>{esc(label)} <b>{esc(value)}</b></span>'
+
+    def kpi(label: str, value, sub: str = '') -> str:
+        return (f'<div class="kpi"><div class="kpi-l">{esc(label)}</div>'
+                f'<div class="kpi-v">{esc(value)}</div>'
+                f'<div class="kpi-s">{esc(sub) if sub else "&nbsp;"}</div></div>')
+
+    def card(title: str, body: str, cls: str = '', anchor: str = '') -> str:
+        if not body.strip():
+            return ''
+        aid = f' id="{anchor}"' if anchor else ''
+        return f'<section class="card {cls}"{aid}><h2>{esc(title)}</h2>{body}</section>'
+
+    chips = ''.join([
+        chip('Version', info.get('app_version') or '?'),
+        chip('Licence', 'valide' if lic_ok else (lic_status or 'inconnue'), 'ok' if lic_ok else 'warn'),
+        chip('FiveM', 'lancé' if fivem_on else 'non lancé', 'ok' if fivem_on else 'mute'),
+        chip('Macros actives', info.get('active_macros') or 'aucune', 'ok' if info.get('active_macros') else 'mute'),
+        chip('Logs', f'{log_err_count} err · {log_warn_count} warn', 'err' if log_err_count else ('warn' if log_warn_count else 'ok')),
+    ])
+    kpis = ''.join([
+        kpi('Système', info.get('os') or '—', info.get('windows_build') or ''),
+        kpi('CPU', info.get('cpu') or '—', info.get('cpu_freq') or ''),
+        kpi('RAM', info.get('ram') or '—', f"process {info.get('process_ram')}" if info.get('process_ram') else ''),
+        kpi('Moteur', info.get('engine_uptime') or '—', f"Windows {info.get('windows_uptime')}" if info.get('windows_uptime') else ''),
+        kpi('Runs (50 derniers)', len(history), f'{run_errors} erreur(s)'),
+    ])
+    network_body = (f'<table>{network_rows}</table>' if network_rows else '') + (map_html or '')
+    windows_count = info.get('open_windows_count', len(windows_list))
+
+    # ── Infos techniques supplémentaires (debug uniquement, rien de plus personnel) ──
+    def kv_table(rows: list[tuple[str, object]]) -> str:
+        body = ''.join(f'<tr><th>{esc(k)}</th><td>{esc(v)}</td></tr>' for k, v in rows if v not in (None, ''))
+        return f'<table>{body}</table>' if body else ''
+
+    # Disposition clavier (AZERTY/QWERTY) — cause n°1 des bugs de touches
+    kb_layout = ''
+    try:
+        import ctypes
+        hkl = ctypes.windll.user32.GetKeyboardLayout(0) & 0xFFFF
+        kb_layout = {0x040C: 'Français (AZERTY)', 0x080C: 'Français Belgique (AZERTY)',
+                     0x100C: 'Français Suisse (QWERTZ)', 0x0C0C: 'Français Canada (QWERTY)',
+                     0x0409: 'Anglais US (QWERTY)', 0x0809: 'Anglais UK (QWERTY)',
+                     0x0407: 'Allemand (QWERTZ)'}.get(hkl, f'0x{hkl:04X}')
+    except Exception:
+        pass
+
+    # Versions des dépendances
+    pkg_rows = []
+    try:
+        from importlib import metadata as _md
+        for pkg in ('pydirectinput', 'pyautogui', 'keyboard', 'pynput', 'mss', 'opencv-python',
+                    'numpy', 'Pillow', 'psutil', 'pytesseract', 'easyocr', 'winsdk', 'pywin32'):
+            try:
+                pkg_rows.append((pkg, _md.version(pkg)))
+            except Exception:
+                pkg_rows.append((pkg, 'non installé'))
+    except Exception:
+        pass
+    sys_rows = [
+        ('Disposition clavier', kb_layout or '—'),
+        ('Échelle affichage', info.get('display_scale')),
+        ('Résolution', info.get('resolution')),
+        ('Python', info.get('python') or sys.version.split()[0]),
+        ('Exécutable', 'embarqué' if 'python-embed' in sys.executable else 'système'),
+    ]
+
+    # Macros (structure seulement, pas le contenu des règles)
+    macro_rows_html = ''
+    macros_count = 0
+    try:
+        with open(os.path.join(ROOT, 'macros.json'), 'r', encoding='utf-8') as f:
+            _macros = json.load(f)
+        if isinstance(_macros, dict):
+            _macros = _macros.get('macros', [])
+        macros_count = len(_macros)
+        macro_rows_html = ''.join(
+            f'<tr><td>{esc(mm.get("name"))}</td><td>{len(mm.get("rules") or [])}</td>'
+            f'<td>{"boucle" if mm.get("loop", True) else "1 passe"}</td>'
+            f'<td>{"oui" if mm.get("humanize") else "non"}</td>'
+            f'<td>{len(mm.get("stop_conditions") or [])}</td>'
+            f'<td>{esc(mm.get("timeout_s") or "—")}</td>'
+            f'<td>{esc(mm.get("max_iterations") or "—")}</td></tr>'
+            for mm in _macros if isinstance(mm, dict)
+        )
+    except Exception:
+        pass
+    macros_html = (
+        '<div class="scroll"><table class="hist"><tr><th>Macro</th><th>Règles</th><th>Mode</th>'
+        '<th>Humanisé</th><th>Conditions d\'arrêt</th><th>Timeout (s)</th><th>Max itér.</th></tr>'
+        + (macro_rows_html or '<tr><td colspan="7" class="empty">Aucune macro</td></tr>')
+        + '</table></div>'
+    )
+
+    # Runners en cours + stats live
+    runner_rows = []
+    try:
+        live = state.stats_get_all() or {}
+        with _runners_lock:
+            for mid, r in _runners.items():
+                st = live.get(mid) or live.get(getattr(r, 'name', mid)) or {}
+                runner_rows.append(
+                    f'<tr><td>{esc(mid)}</td><td>{"actif" if r.is_running() else "arrêté"}</td>'
+                    f'<td>{esc(st.get("iterations", 0))}</td><td>{esc(st.get("errors", 0))}</td>'
+                    f'<td>{esc(st.get("last_rule") or "—")}</td></tr>')
+    except Exception:
+        pass
+    runners_html = (
+        '<table class="hist"><tr><th>Runner</th><th>État</th><th>Cycles</th><th>Erreurs</th><th>Dernière règle</th></tr>'
+        + (''.join(runner_rows) or '<tr><td colspan="5" class="empty">Aucun runner</td></tr>') + '</table>'
+    )
+
+    # Session (instantané poussé par l'interface)
+    snap = _session_snapshot or {}
+    abf = snap.get('abf') or {}
+    dur = int(snap.get('durationS') or 0)
+    session_html = kv_table([
+        ('Durée', f'{dur // 3600} h {dur % 3600 // 60:02d}' if snap else '—'),
+        ('Cycles', snap.get('cycles')),
+        ('Erreurs', snap.get('errors')),
+        ('Auto Bouffe actif', 'oui' if _abf_running else 'non'),
+        ('Repas réussis / ratés', f"{abf.get('meals', 0)} / {abf.get('mealFails', 0)}" if abf else None),
+        ('Coffres rouverts / ratés', f"{abf.get('trunkReopened', 0)} / {abf.get('trunkFails', 0)}" if abf else None),
+    ])
+    sess_macro_rows = ''.join(
+        f'<tr><td>{esc(sm.get("name"))}</td><td>{esc(sm.get("runs"))}</td><td>{esc(sm.get("cycles"))}</td>'
+        f'<td>{esc(sm.get("errors"))}</td><td>{esc(round((sm.get("activeS") or 0) / 60))} min</td>'
+        f'<td>{esc(", ".join(f"{k} {v}" for k, v in (sm.get("stopReasons") or {}).items() if v) or "—")}</td></tr>'
+        for sm in (snap.get('macros') or []) if isinstance(sm, dict)
+    )
+    if sess_macro_rows:
+        session_html += ('<div class="scroll" style="margin-top:12px"><table class="hist"><tr><th>Macro</th>'
+                         '<th>Lancements</th><th>Cycles</th><th>Erreurs</th><th>Actif</th><th>Arrêts</th></tr>'
+                         + sess_macro_rows + '</table></div>')
+
+    # Webhook / alertes (état seulement — aucune URL)
+    webhook_html = kv_table([
+        ('Webhook utilisateur', 'configuré' if _webhook_url else 'non configuré'),
+        ('État', 'désactivé (403)' if _webhook_disabled else f'OK ({_webhook_fail_count} échec(s) récents)'),
+        ('Événements', ', '.join(sorted(_webhook_events)) or '—'),
+        ('Mention sur alerte', 'oui' if _webhook_mention_id else 'non'),
+        ('Seuil erreurs', _webhook_error_threshold),
+        ('Capture sur alerte', 'oui' if _webhook_alert_screenshot else 'non'),
+        ('Résumé à la fermeture', 'oui' if _webhook_session_on_exit else 'non'),
+    ])
+
+    # État partagé (compteurs / variables : noms + valeurs courtes)
+    state_rows = []
+    try:
+        for k, v in sorted((state.get_all_counters() or {}).items()):
+            state_rows.append((f'compteur · {k}', v))
+        for k, v in sorted((state.get_all_variables() or {}).items()):
+            sv = str(v)
+            state_rows.append((f'variable · {k}', sv if len(sv) <= 80 else sv[:77] + '…'))
+    except Exception:
+        pass
+    state_html = kv_table(state_rows) or '<div class="muted">Aucun compteur ni variable.</div>'
+
+    # Erreurs extraites des logs
+    err_lines = [l for l in log_lines if _log_cls(l) in ('l-err', 'l-warn')][-30:]
+    errors_html = (''.join(f'<div class="{_log_cls(l)}">{_html.escape(l.rstrip())}</div>' for l in err_lines)
+                   or '<div class="l-dbg">Aucune erreur ni avertissement récent.</div>')
+
+    sections = [
+        ('apercu', 'Aperçu', None),
+        ('erreurs', 'Erreurs', log_err_count + log_warn_count),
+        ('session', 'Session', snap.get('cycles') if snap else None),
+        ('macros', 'Macros', macros_count),
+        ('runners', 'Runners', len(runner_rows)),
+        ('historique', 'Historique', len(history)),
+        ('alertes', 'Alertes', None),
+        ('machine', 'Machine', None),
+        ('reseau', 'Réseau', None),
+        ('composants', 'Composants', None),
+        ('logiciel', 'Logiciel', None),
+        ('etat', 'État partagé', len(state_rows)),
+        ('fenetres', 'Fenêtres', windows_count),
+        ('logs', 'Logs', len(log_lines)),
+    ]
+    nav = ''.join(
+        f'<a href="#{a}"><span>{esc(t)}</span>'
+        + (f'<em class="{"bad" if a == "erreurs" and c else ""}">{esc(c)}</em>' if c not in (None, '') else '')
+        + '</a>'
+        for a, t, c in sections
+    )
+
     page = f"""<!DOCTYPE html>
 <html lang="fr"><head><meta charset="utf-8">
-<title>MacroEngine — Rapport</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MacroEngine — Rapport de diagnostic</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
 <style>
-  :root {{ color-scheme: dark; }}
-  body {{ background:#0d0d14; color:#e4e4ef; font-family: -apple-system, Segoe UI, sans-serif; margin:0; padding:24px 32px 60px; }}
-  h1 {{ font-size:20px; margin:0 0 4px; }}
-  .generated {{ color:#8888a0; font-size:12px; margin-bottom:28px; }}
-  h2 {{ font-size:13px; text-transform:uppercase; letter-spacing:.06em; color:#8888a0; margin:32px 0 10px; border-bottom:1px solid #24243a; padding-bottom:6px; }}
-  .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:24px; align-items:start; }}
+  :root {{
+    color-scheme: dark;
+    --bg:#0c0c0f; --panel:#101014; --card:#141418; --card2:#0f0f13; --hover:#1c1c22;
+    --b1:#1f1f26; --b2:#2a2a33; --accent:#e5372b; --accent2:#ff6b5e;
+    --t1:#ededf0; --t2:#a3a3b2; --t3:#6e6e7c; --label:#9a9aa8;
+    --ok:#4ade80; --warn:#fbbf24; --err:#ef4444;
+    --fd:'Barlow Condensed','Barlow','Segoe UI',sans-serif; --f:'Barlow','Segoe UI',system-ui,sans-serif;
+    --mono:Consolas,'Cascadia Code','Courier New',monospace;
+  }}
+  * {{ box-sizing:border-box; }}
+  html {{ scroll-behavior:smooth; }}
+  body {{ margin:0; background:var(--bg); color:var(--t1); font:14px/1.45 var(--f); }}
+  a {{ color:var(--accent2); }}
+  .layout {{ display:flex; min-height:100vh; }}
+  aside {{ width:232px; flex-shrink:0; background:var(--panel); border-right:1px solid var(--b1); position:sticky; top:0; height:100vh; overflow-y:auto; padding:20px 12px; display:flex; flex-direction:column; gap:18px; }}
+  .brand {{ display:flex; align-items:center; gap:10px; padding:0 8px; }}
+  .logo {{ width:30px; height:30px; border-radius:7px; background:var(--accent); display:grid; place-items:center; font:700 17px var(--fd); color:#fff; }}
+  .brand b {{ font:700 20px var(--fd); letter-spacing:.03em; }}
+  .brand small {{ display:block; color:var(--t3); font-size:11px; }}
+  aside nav {{ display:flex; flex-direction:column; gap:2px; }}
+  aside nav a {{ display:flex; align-items:center; justify-content:space-between; gap:8px; padding:9px 12px; border-radius:8px; color:var(--t2); text-decoration:none; font-weight:500; }}
+  aside nav a:hover {{ background:var(--hover); color:var(--t1); }}
+  aside nav a.active {{ background:var(--hover); color:#fff; box-shadow:inset 3px 0 0 var(--accent); }}
+  aside nav em {{ font-style:normal; font-size:11.5px; color:var(--t3); background:var(--card); border:1px solid var(--b1); border-radius:999px; padding:1px 8px; font-variant-numeric:tabular-nums; }}
+  aside nav em.bad {{ color:#fff; background:var(--err); border-color:var(--err); }}
+  .aside-foot {{ margin-top:auto; padding:10px 12px; border:1px solid var(--b1); border-radius:10px; font-size:12px; color:var(--t2); }}
+  main {{ flex:1; min-width:0; padding:0 32px 64px; max-width:1240px; }}
+  .hero {{ padding:30px 0 18px; display:flex; flex-direction:column; gap:14px; }}
+  .eyebrow {{ color:var(--label); font-size:12px; letter-spacing:.14em; text-transform:uppercase; }}
+  h1 {{ margin:0; font:700 42px/1 var(--fd); letter-spacing:.01em; text-transform:uppercase; }}
+  .chips {{ display:flex; flex-wrap:wrap; gap:8px; }}
+  .chip {{ display:inline-flex; align-items:center; gap:7px; padding:6px 11px; border-radius:999px; background:var(--card); border:1px solid var(--b1); color:var(--t2); font-size:13px; }}
+  .chip b {{ color:var(--t1); font-weight:600; }}
+  .chip-dot {{ width:7px; height:7px; border-radius:50%; background:var(--t3); }}
+  .chip.ok .chip-dot {{ background:var(--ok); }} .chip.warn .chip-dot {{ background:var(--warn); }}
+  .chip.err .chip-dot {{ background:var(--err); }} .chip.err {{ border-color:rgba(239,68,68,.4); }}
+  .lic {{ color:var(--t2); font-size:13px; }} .lic code {{ font-family:var(--mono); color:var(--t1); background:var(--card); border:1px solid var(--b1); padding:2px 8px; border-radius:6px; }}
+  .kpis {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:12px; margin:8px 0 20px; }}
+  .kpi {{ background:var(--card); border:1px solid var(--b1); border-radius:12px; padding:14px 16px; min-width:0; }}
+  .kpi-l {{ color:var(--label); font-size:12px; }}
+  .kpi-v {{ font:600 22px/1.15 var(--fd); margin-top:4px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .kpi-s {{ color:var(--t3); font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; align-items:start; }}
+  .col {{ display:flex; flex-direction:column; gap:16px; min-width:0; }}
+  .card {{ background:var(--card); border:1px solid var(--b1); border-radius:12px; padding:18px 20px; min-width:0; scroll-margin-top:16px; }}
+  .card.full {{ grid-column:1 / -1; }}
+  h2 {{ margin:0 0 12px; font:600 20px var(--fd); letter-spacing:.04em; text-transform:uppercase; }}
   table {{ width:100%; border-collapse:collapse; font-size:13px; }}
-  th, td {{ text-align:left; padding:5px 10px; border-bottom:1px solid #1c1c2c; }}
-  th {{ color:#8888a0; font-weight:600; width:40%; }}
-  .map {{ width:100%; height:320px; border-radius:8px; border:1px solid #24243a; }}
-  .lic {{ font-size:14px; }}
-  .lic code {{ background:#1c1c2c; padding:3px 8px; border-radius:5px; }}
-  pre {{ background:#08080e; border:1px solid #24243a; border-radius:8px; padding:14px; font-size:11px; line-height:1.5; overflow-x:auto; max-height:400px; overflow-y:auto; }}
-  td.err {{ color:#e8352a; font-weight:700; }}
-  td.empty {{ color:#8888a0; text-align:center; padding:16px; }}
-  .winlist {{ columns:2; column-gap:24px; font-size:12.5px; padding-left:18px; margin:0; }}
-  .winlist li {{ break-inside:avoid; padding:2px 0; color:#c8c8d8; }}
-  .winlist li.empty {{ color:#8888a0; list-style:none; margin-left:-18px; }}
+  th, td {{ text-align:left; padding:7px 10px; border-bottom:1px solid var(--b1); vertical-align:top; overflow-wrap:anywhere; }}
+  tr:last-child th, tr:last-child td {{ border-bottom:0; }}
+  th {{ color:var(--label); font-weight:500; width:38%; }}
+  .hist th {{ width:auto; background:var(--card2); position:sticky; top:0; }}
+  .hist td {{ font-variant-numeric:tabular-nums; }}
+  td.err {{ color:var(--err); font-weight:600; }}
+  td.empty, li.empty {{ color:var(--t3); text-align:center; padding:16px; list-style:none; }}
+  .muted {{ color:var(--t3); }}
+  .map {{ width:100%; height:240px; border:1px solid var(--b1); border-radius:10px; margin-top:12px; }}
+  .winlist {{ list-style:none; margin:0; padding:0; display:flex; flex-wrap:wrap; gap:6px; }}
+  .winlist li {{ background:var(--card2); border:1px solid var(--b1); border-radius:8px; padding:4px 10px; font-size:12.5px; color:var(--t2); max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+  .scroll {{ max-height:420px; overflow:auto; border-radius:8px; }}
+  .logs {{ background:var(--card2); border:1px solid var(--b1); border-radius:10px; padding:12px 14px; font:12px/1.55 var(--mono); max-height:520px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; color:var(--t2); }}
+  .logs .l-err {{ color:var(--err); }} .logs .l-warn {{ color:var(--warn); }} .logs .l-dbg {{ color:var(--t3); }}
+  footer {{ color:var(--t3); font-size:12px; text-align:center; margin-top:28px; }}
+  @media (max-width:1000px) {{
+    .layout {{ flex-direction:column; }}
+    aside {{ position:sticky; width:auto; height:auto; z-index:5; padding:10px 12px; flex-direction:row; align-items:center; border-right:0; border-bottom:1px solid var(--b1); overflow-x:auto; }}
+    aside nav {{ flex-direction:row; }} aside nav a {{ white-space:nowrap; }}
+    .aside-foot, .brand small {{ display:none; }}
+    main {{ padding:0 16px 48px; }}
+    .kpis {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .grid {{ grid-template-columns:minmax(0,1fr); }} h1 {{ font-size:32px; }}
+  }}
 </style></head>
 <body>
-  <h1>🤖 MacroEngine — Rapport</h1>
-  <div class="generated">Généré le {esc(generated_at)}</div>
-
-  <h2>🔑 Licence</h2>
-  <div class="lic"><code>{esc(lic_value)}</code>{f' — {esc(lic_status)}' if lic_status else ''}</div>
-
-  <h2>🖥️ Machine &amp; réseau</h2>
-  <div class="grid">
-    <table>{machine_rows}</table>
-    <table>{network_rows}{app_rows}</table>
+<div class="layout">
+<aside>
+  <div class="brand"><div class="logo">M</div><div><b>MACROENGINE</b><small>Rapport de diagnostic</small></div></div>
+  <nav aria-label="Sections du rapport">{nav}</nav>
+  <div class="aside-foot">v{esc(info.get('app_version') or '?')} · {esc(generated_at)}</div>
+</aside>
+<main>
+  <div class="hero" id="apercu">
+    <div class="eyebrow">Rapport de diagnostic · {esc(generated_at)}</div>
+    <h1>{esc(info.get('hostname') or 'Machine inconnue')}</h1>
+    <div class="chips">{chips}</div>
+    <div class="lic">Licence <code>{esc(lic_value)}</code>{f' — {esc(lic_status)}' if lic_status else ''}</div>
   </div>
-  {f'<div style="margin-top:16px">{map_html}</div>' if map_html else ''}
 
-  <h2>🧩 Composants</h2>
-  <table>{components_rows}</table>
+  <div class="kpis">{kpis}</div>
 
-  <h2>🪟 Fenêtres ouvertes ({esc(info.get('open_windows_count', len(windows_list)))})</h2>
-  <ul class="winlist">{windows_list_html}</ul>
-
-  <h2>📊 Historique des runs (50 derniers)</h2>
-  <table>
-    <tr><th>Macro</th><th>Terminé</th><th>Cycles</th><th>Durée</th><th>Erreurs</th></tr>
-    {history_rows}
-  </table>
-
-  <h2>📜 Logs récents (200 dernières lignes)</h2>
-  <pre>{log_html}</pre>
+  <div class="grid">
+    {card(f'Erreurs & avertissements récents ({log_err_count + log_warn_count})', f'<div class="logs" style="max-height:300px">{errors_html}</div>', 'full', 'erreurs')}
+    {card('Session en cours', session_html or '<div class="muted">Aucune donnée de session reçue.</div>', 'full', 'session')}
+    {card(f'Macros ({macros_count})', macros_html, 'full', 'macros')}
+    {card('Runners', runners_html, '', 'runners')}
+    {card('Alertes & webhook', webhook_html, '', 'alertes')}
+    {card('Historique des runs (50 derniers)', f'<div class="scroll"><table class="hist"><tr><th>Macro</th><th>Terminé</th><th>Cycles</th><th>Durée</th><th>Erreurs</th></tr>{history_rows}</table></div>', 'full', 'historique')}
+    {card('Machine', f'<table>{machine_rows}</table>' if machine_rows else '', anchor='machine')}
+    <div class="col">
+      {card('Réseau', network_body, anchor='reseau')}
+      {card('Application', f'<table>{app_rows}</table>' if app_rows else '')}
+    </div>
+    {card('Composants', f'<table>{components_rows}</table>' if components_rows else '', anchor='composants')}
+    <div class="col">
+      {card('Logiciel', kv_table(sys_rows), anchor='logiciel')}
+      {card('Dépendances Python', kv_table(pkg_rows))}
+    </div>
+    {card(f'État partagé ({len(state_rows)})', state_html, 'full', 'etat')}
+    {card(f'Fenêtres ouvertes ({windows_count})', f'<ul class="winlist">{windows_list_html}</ul>', 'full', 'fenetres')}
+    {card(f'Logs récents ({len(log_lines)} lignes)', f'<div class="logs">{log_html}</div>', 'full', 'logs')}
+  </div>
+  <footer>MacroEngine {esc(info.get('app_version') or '')} · rapport généré automatiquement · capture d'écran jointe séparément au message</footer>
+</main>
+</div>
+<script>
+  (function () {{
+    var links = Array.prototype.slice.call(document.querySelectorAll('aside nav a'));
+    var byId = {{}};
+    links = links.filter(function (a) {{
+      // empty sections aren't rendered — drop their nav link
+      if (document.getElementById(a.getAttribute('href').slice(1))) return true;
+      a.remove(); return false;
+    }});
+    links.forEach(function (a) {{ byId[a.getAttribute('href').slice(1)] = a; }});
+    if (!('IntersectionObserver' in window)) return;
+    var obs = new IntersectionObserver(function (entries) {{
+      entries.forEach(function (e) {{
+        if (!e.isIntersecting) return;
+        links.forEach(function (a) {{ a.classList.remove('active'); }});
+        var a = byId[e.target.id]; if (a) a.classList.add('active');
+      }});
+    }}, {{ rootMargin: '-10% 0px -80% 0px' }});
+    Object.keys(byId).forEach(function (id) {{ var el = document.getElementById(id); if (el) obs.observe(el); }});
+  }})();
+</script>
 </body></html>"""
 
     page_bytes = page.encode('utf-8')
@@ -653,6 +1025,10 @@ _EVENT_STYLE = {
     'autobouffe_start':  ('🟢', 'Auto Bouffe démarré',   0x3ddc84),
     'autobouffe_stop':   ('🔴', 'Auto Bouffe arrêté',    0xe8352a),
     'test':              ('🧪', 'Test webhook',          0xa78bfa),
+    'game_closed':       ('💥', 'FiveM fermé / crashé',  0xef4444),
+    'macro_errors':      ('⚠️', 'Erreurs macro',         0xfbbf24),
+    'autobouffe_fail':   ('🍔', 'Auto Bouffe en échec',  0xef4444),
+    'session_summary':   ('📊', 'Résumé de session',     0x5865F2),
 }
 
 def _build_discord_embed(event: str, data: dict) -> dict:
@@ -671,7 +1047,13 @@ def _build_discord_embed(event: str, data: dict) -> dict:
     _add_field('📋 Détails', [
         ('name', 'Macro'), ('macro', 'Macro'), ('rule', 'Règle'),
         ('reason', 'Raison'), ('iterations', 'Itérations'), ('elapsed', 'Écoulé (s)'),
+        ('errors', 'Erreurs'), ('threshold', 'Seuil'), ('outcome', 'Résultat'),
+        ('active_macros', 'Macros actives'),
     ], inline=False)
+
+    sl = data.get('summary_lines')
+    if isinstance(sl, (list, tuple)) and sl:
+        fields.append({'name': '📊 Session', 'value': '\n'.join(str(x) for x in sl)[:1024], 'inline': False})
 
     _add_field('🖥️ Machine', [
         ('hostname', 'Hôte'), ('username', 'Utilisateur'), ('full_name', 'Nom complet'),
@@ -701,7 +1083,8 @@ def _build_discord_embed(event: str, data: dict) -> dict:
     return embed
 
 
-def _build_discord_multipart(embed: dict, files: list[tuple[str, str, bytes]]) -> tuple[bytes, str]:
+def _build_discord_multipart(embed: dict, files: list[tuple[str, str, bytes]],
+                             extra: dict | None = None) -> tuple[bytes, str]:
     """
     Construit un corps multipart/form-data pour joindre des fichiers à un embed
     Discord. `files` = liste de (filename, content_type, bytes), dans l'ordre
@@ -709,7 +1092,7 @@ def _build_discord_multipart(embed: dict, files: list[tuple[str, str, bytes]]) -
     """
     import uuid
     boundary = uuid.uuid4().hex
-    payload_json = json.dumps({'embeds': [embed]}, ensure_ascii=False)
+    payload_json = json.dumps({'embeds': [embed], **(extra or {})}, ensure_ascii=False)
 
     parts = []
     parts.append(
@@ -729,24 +1112,246 @@ def _build_discord_multipart(embed: dict, files: list[tuple[str, str, bytes]]) -
     return b''.join(parts), f'multipart/form-data; boundary={boundary}'
 
 
+def _capture_game_png() -> bytes | None:
+    """PNG (max 1280 px de large) de la fenêtre FiveM, sinon du moniteur
+    principal. Toute erreur → None (l'alerte part alors sans image)."""
+    try:
+        import io
+        from modules.engine.window_manager import list_windows, get_window_rect
+        from modules.engine.screen_reader import capture_region_pil
+        try:
+            rect = None
+            for w in list_windows():
+                if 'fivem' not in (w.get('exe') or '').lower():
+                    continue
+                r = get_window_rect(w['hwnd'])  # (left, top, right, bottom)
+                if r and (r[2] - r[0]) > 0 and (r[3] - r[1]) > 0:
+                    rect = r
+                    break
+            if rect:
+                img = capture_region_pil(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1])
+            else:
+                import mss
+                from PIL import Image
+                with mss.mss() as sct:
+                    raw = sct.grab(sct.monitors[1])
+                    img = Image.frombytes('RGB', raw.size, raw.rgb)
+            img.thumbnail((1280, 100000))
+            buf = io.BytesIO()
+            img.save(buf, format='PNG')
+            return buf.getvalue()
+        finally:
+            _release_sct()
+    except Exception as e:
+        _webhook_log.debug(f'Capture alerte: échec — {e}')
+        return None
+
+
+def _post_webhook(event: str, data: dict, timeout_cap: float | None = None) -> bool:
+    """
+    Construit et poste la requête webhook UTILISATEUR dans le thread courant
+    (aucun rate-limit ici). Gère circuit-breaker 403 et backoff 429. Renvoie
+    True si HTTP 2xx. `timeout_cap` plafonne le timeout urlopen. N'inclut
+    jamais le rapport debug (voir _post_debug_webhook).
+    """
+    global _webhook_fail_count, _webhook_disabled, _webhook_last_sent
+    try:
+        is_discord = 'discord.com/api/webhooks' in _webhook_url
+        critical = event in _CRITICAL_EVENTS
+        alert_png = None
+        # game_closed : la fenêtre du jeu n'existe plus -> la capture montrerait tout le bureau
+        if is_discord and critical and _webhook_alert_screenshot and event != 'game_closed':
+            alert_png = _capture_game_png()
+        has_files = bool(alert_png)
+        if is_discord:
+            embed = _build_discord_embed(event, data)
+            extra = {}
+            mid = _webhook_mention_id
+            if critical and mid and mid.isdigit():
+                extra = {'content': f'<@{mid}>', 'allowed_mentions': {'users': [mid]}}
+            if has_files:
+                files = []
+                if alert_png:
+                    embed['image'] = {'url': 'attachment://alert.png'}
+                    files.append(('alert.png', 'image/png', alert_png))
+                payload, content_type_header = _build_discord_multipart(embed, files, extra)
+            else:
+                payload = json.dumps({'embeds': [embed], **extra}).encode('utf-8')
+                content_type_header = 'application/json'
+        else:
+            payload = json.dumps({'event': event, 'data': data, 'source': 'MacroEngine'}, ensure_ascii=False).encode('utf-8')
+            content_type_header = 'application/json'
+        req = urllib.request.Request(
+            _webhook_url,
+            data=payload,
+            method='POST',
+            headers={
+                'Content-Type': content_type_header,
+                'User-Agent':   'MacroEngine/1.0',
+            },
+        )
+        # Upload d'un screenshot/rapport peut dépasser 5s sur connexion lente
+        # — délai plus large uniquement quand des fichiers sont joints.
+        timeout = 15 if has_files else 5
+        if timeout_cap is not None:
+            timeout = min(timeout, timeout_cap)
+        resp = urllib.request.urlopen(req, timeout=timeout)
+        _webhook_log.info(
+            f'Webhook "{event}" envoyé — HTTP {resp.status} '
+            f'(capture: {"oui" if alert_png else "non"})'
+        )
+
+        # Succès — réinitialiser compteur d'échecs (le slot _webhook_last_sent
+        # est déjà réservé avant le lancement du thread, pas besoin de le réécrire)
+        with _webhook_lock:
+            _webhook_fail_count = 0
+        return 200 <= int(resp.status) < 300
+
+    except urllib.error.HTTPError as e:
+        with _webhook_lock:
+            _webhook_fail_count += 1
+            fails = _webhook_fail_count
+
+        if e.code == 403:
+            # 403 = URL invalide ou webhook supprimé — inutile de réessayer
+            if fails >= _WEBHOOK_MAX_FAILS:
+                with _webhook_lock:
+                    _webhook_disabled = True
+                _webhook_log.error(
+                    f'Webhook désactivé : {_WEBHOOK_MAX_FAILS} erreurs 403 consécutives. '
+                    f'L\'URL est invalide ou le webhook Discord a été supprimé. '
+                    f'Mettez à jour l\'URL dans les paramètres.'
+                )
+                _send({'type': 'webhook_error', 'code': 403,
+                       'msg': 'Webhook désactivé — URL invalide ou supprimée. '
+                              'Corrigez l\'URL dans Paramètres > Webhook.'})
+            else:
+                _webhook_log.warning(
+                    f'Webhook 403 ({fails}/{_WEBHOOK_MAX_FAILS}) — '
+                    f'URL invalide ou webhook Discord supprimé.'
+                )
+        elif e.code == 429:
+            # 429 = rate limit Discord — augmenter l'intervalle temporairement
+            _webhook_log.warning('Webhook rate-limité par Discord (429). Ralentissement.')
+            with _webhook_lock:
+                _webhook_last_sent = time.time() + 10  # pause 10s supplémentaires
+        else:
+            _webhook_log.warning(f'Webhook HTTP {e.code}: {e.reason}')
+        return False
+
+    except Exception as e:
+        with _webhook_lock:
+            _webhook_fail_count += 1
+        _webhook_log.warning(f'Webhook erreur réseau: {e}')
+        return False
+
+
+def _post_debug_webhook(event: str, data: dict) -> bool:
+    """Poste le rapport debug (screenshot + infos PC + report.html) vers
+    _debug_webhook_url, dans le thread courant. Circuit-breaker 403 propre.
+    Un échec ici n'affecte jamais le canal utilisateur."""
+    global _debug_fail_count, _debug_disabled, _debug_last_sent
+    url = _debug_webhook_url
+    if not url:
+        return False
+    try:
+        info, image_bytes = _gather_debug_report()
+        data = {**data, **info}
+        report_bytes = None
+        try:
+            report_bytes = _generate_html_report(info)
+        except Exception as e:
+            _webhook_log.debug(f'Rapport HTML: génération échouée — {e}')
+        if 'discord.com/api/webhooks' in url:
+            embed = _build_discord_embed(event, data)
+            files = []
+            if image_bytes:
+                embed['image'] = {'url': 'attachment://screenshot.png'}
+                files.append(('screenshot.png', 'image/png', image_bytes))
+            if report_bytes:
+                files.append(('report.html', 'text/html', report_bytes))
+            if files:
+                payload, ctype = _build_discord_multipart(embed, files)
+            else:
+                payload = json.dumps({'embeds': [embed]}).encode('utf-8')
+                ctype = 'application/json'
+        else:
+            payload = json.dumps({'event': event, 'data': data, 'source': 'MacroEngine'},
+                                 ensure_ascii=False).encode('utf-8')
+            ctype = 'application/json'
+        req = urllib.request.Request(url, data=payload, method='POST',
+                                     headers={'Content-Type': ctype, 'User-Agent': 'MacroEngine/1.0'})
+        resp = urllib.request.urlopen(req, timeout=15)
+        with _debug_lock:
+            _debug_fail_count = 0
+        return 200 <= int(resp.status) < 300
+    except urllib.error.HTTPError as e:
+        with _debug_lock:
+            _debug_fail_count += 1
+            if e.code == 403 and _debug_fail_count >= _WEBHOOK_MAX_FAILS:
+                _debug_disabled = True
+            if e.code == 429:
+                _debug_last_sent = time.time() + 10  # backoff 10 s comme le canal utilisateur
+        _webhook_log.debug(f'Canal debug HTTP {e.code}')
+        return False
+    except Exception as e:
+        with _debug_lock:
+            _debug_fail_count += 1
+        _webhook_log.debug(f'Canal debug erreur: {e}')
+        return False
+
+
+def _send_debug_report(event: str, data: dict) -> str:
+    """Envoi asynchrone du rapport debug vers le canal développeur. Conditions :
+    consentement + URL debug + circuit-breaker fermé + événement autorisé
+    (mêmes filtres que le canal utilisateur). Rate-limit 2 s : drop."""
+    global _debug_last_sent
+    if not (_debug_consent and _debug_webhook_url):
+        return 'off'
+    if event != 'test' and event not in _webhook_events:
+        return 'event_filtered'
+    if event == 'rule_triggered':
+        return 'event_filtered'  # trop bavard pour le canal développeur
+    with _debug_lock:
+        if _debug_disabled:
+            return 'disabled'
+        now = time.time()
+        if now - _debug_last_sent < _debug_min_interval:
+            return 'rate_limited'
+        _debug_last_sent = now
+
+    def _run():
+        try:
+            _post_debug_webhook(event, data)
+        finally:
+            _release_sct()
+    threading.Thread(target=_run, daemon=True, name='debug-webhook').start()
+    return 'sent'
+
+
 def _send_webhook(event: str, data: dict):
     """
     Envoie une notification Discord webhook.
 
     Protections intégrées :
-      - Rate-limit   : minimum 2s entre deux envois (évite le spam Discord)
+      - Rate-limit   : minimum 2s entre deux envois (évite le spam Discord).
+        Les événements critiques (_CRITICAL_EVENTS) ne sont pas jetés : ils
+        réservent le prochain créneau et partent différés ('queued').
       - Circuit-breaker : se désactive automatiquement après 3 échecs 403
         consécutifs (URL invalide/expirée) — se réactive si l'URL change
       - Envoi en thread de fond : ne bloque jamais le runner
 
-    Si _webhook_debug_screenshot est actif, joint un screenshot + infos PC
-    (IP, OS, CPU/RAM, licence...) à TOUTE notification, quel que soit
-    l'event — envoyé UNIQUEMENT vers l'URL que l'utilisateur a lui-même
-    configurée (_webhook_url), jamais ailleurs. Sans URL configurée, cette
-    fonction ne fait rien (return direct ci-dessous), donc rien n'est jamais
-    capturé ni envoyé par défaut.
+    Le rapport debug (IP, MAC, screenshot...) n'est JAMAIS joint ici : si
+    _debug_consent et _debug_webhook_url, un envoi séparé du même événement part
+    vers le canal développeur (_send_debug_report), indépendamment du canal
+    utilisateur (même si _webhook_url est vide).
     """
-    global _webhook_fail_count, _webhook_disabled, _webhook_last_sent
+    global _webhook_last_sent
+
+    try:
+        _send_debug_report(event, data)
+    except Exception as e:
+        _webhook_log.debug(f'Canal debug: {e}')
 
     if not _webhook_url:
         return 'no_url'
@@ -758,117 +1363,48 @@ def _send_webhook(event: str, data: dict):
     if event != 'test' and event not in _webhook_events:
         return 'event_filtered'
 
+    delay = 0.0
     with _webhook_lock:
         if _webhook_disabled:
             return 'disabled'
 
-        # Rate-limit : ignorer si trop récent
+        # Rate-limit : ignorer si trop récent (sauf critique → file d'attente)
         now = time.time()
         if now - _webhook_last_sent < _webhook_min_interval:
-            return 'rate_limited'
-        # Réserver le slot immédiatement pour éviter la race condition
-        # (deux threads vérifiant simultanément avant que _do_send mette à jour)
-        _webhook_last_sent = now
+            if event not in _CRITICAL_EVENTS:
+                return 'rate_limited'
+            slot = _webhook_last_sent + _webhook_min_interval
+            _webhook_last_sent = slot
+            delay = max(0.0, slot - now)
+        else:
+            # Réserver le slot immédiatement pour éviter la race condition
+            # (deux threads vérifiant simultanément avant que _do_send mette à jour)
+            _webhook_last_sent = now
 
-    def _do_send():
-        nonlocal data
-        global _webhook_fail_count, _webhook_disabled
+    def _do_send_release():
         try:
-            # Gathered here, inside the background send thread — never on the
-            # engine's main IPC thread or the macro runner thread. A
-            # screenshot capture + the public-IP network call (up to 3s) is
-            # too slow to run synchronously on either of those without
-            # risking stalling command processing / rule evaluation.
-            image_bytes  = None
-            report_bytes = None
-            if _webhook_debug_screenshot:
-                info, image_bytes = _gather_debug_report()
-                data = {**data, **info}
-                try:
-                    report_bytes = _generate_html_report(info)
-                except Exception as e:
-                    _webhook_log.debug(f'Rapport HTML: génération échouée — {e}')
+            _post_webhook(event, data)
+        finally:
+            _release_sct()  # capture_all_screens a créé une instance mss pour ce thread
 
-            is_discord = 'discord.com/api/webhooks' in _webhook_url
-            has_files = bool(image_bytes or report_bytes)
-            if is_discord:
-                embed = _build_discord_embed(event, data)
-                if has_files:
-                    files = []
-                    if image_bytes:
-                        embed['image'] = {'url': 'attachment://screenshot.png'}
-                        files.append(('screenshot.png', 'image/png', image_bytes))
-                    if report_bytes:
-                        files.append(('report.html', 'text/html', report_bytes))
-                    body, content_type = _build_discord_multipart(embed, files)
-                    payload = body
-                    content_type_header = content_type
-                else:
-                    payload = json.dumps({'embeds': [embed]}).encode('utf-8')
-                    content_type_header = 'application/json'
-            else:
-                payload = json.dumps({'event': event, 'data': data, 'source': 'MacroEngine'}, ensure_ascii=False).encode('utf-8')
-                content_type_header = 'application/json'
-            req = urllib.request.Request(
-                _webhook_url,
-                data=payload,
-                method='POST',
-                headers={
-                    'Content-Type': content_type_header,
-                    'User-Agent':   'MacroEngine/1.0',
-                },
-            )
-            # Upload d'un screenshot/rapport peut dépasser 5s sur connexion lente
-            # — délai plus large uniquement quand des fichiers sont joints.
-            resp = urllib.request.urlopen(req, timeout=15 if has_files else 5)
-            _webhook_log.info(
-                f'Webhook "{event}" envoyé — HTTP {resp.status} '
-                f'(screenshot: {"oui" if image_bytes else "non"}, rapport: {"oui" if report_bytes else "non"})'
-            )
+    if delay > 0:
+        t = threading.Timer(delay, _do_send_release)
+        t.daemon = True
+        t.start()
+        return 'queued'
 
-            # Succès — réinitialiser compteur d'échecs (le slot _webhook_last_sent
-            # est déjà réservé avant le lancement du thread, pas besoin de le réécrire)
-            with _webhook_lock:
-                _webhook_fail_count = 0
-
-        except urllib.error.HTTPError as e:
-            with _webhook_lock:
-                _webhook_fail_count += 1
-                fails = _webhook_fail_count
-
-            if e.code == 403:
-                # 403 = URL invalide ou webhook supprimé — inutile de réessayer
-                if fails >= _WEBHOOK_MAX_FAILS:
-                    with _webhook_lock:
-                        _webhook_disabled = True
-                    _webhook_log.error(
-                        f'Webhook désactivé : {_WEBHOOK_MAX_FAILS} erreurs 403 consécutives. '
-                        f'L\'URL est invalide ou le webhook Discord a été supprimé. '
-                        f'Mettez à jour l\'URL dans les paramètres.'
-                    )
-                    _send({'type': 'webhook_error', 'code': 403,
-                           'msg': 'Webhook désactivé — URL invalide ou supprimée. '
-                                  'Corrigez l\'URL dans Paramètres > Webhook.'})
-                else:
-                    _webhook_log.warning(
-                        f'Webhook 403 ({fails}/{_WEBHOOK_MAX_FAILS}) — '
-                        f'URL invalide ou webhook Discord supprimé.'
-                    )
-            elif e.code == 429:
-                # 429 = rate limit Discord — augmenter l'intervalle temporairement
-                _webhook_log.warning('Webhook rate-limité par Discord (429). Ralentissement.')
-                with _webhook_lock:
-                    _webhook_last_sent = time.time() + 10  # pause 10s supplémentaires
-            else:
-                _webhook_log.warning(f'Webhook HTTP {e.code}: {e.reason}')
-
-        except Exception as e:
-            with _webhook_lock:
-                _webhook_fail_count += 1
-            _webhook_log.warning(f'Webhook erreur réseau: {e}')
-
-    threading.Thread(target=_do_send, daemon=True).start()
+    threading.Thread(target=_do_send_release, daemon=True).start()
     return 'sent'  # envoi lancé — le résultat HTTP réel arrive en async, voir logs/webhook_error
+
+
+def _send_webhook_sync(event: str, data: dict, timeout: float = 5.0) -> bool:
+    """Envoi bloquant dans le thread appelant, sans rate-limit
+    (résumé de session à la fermeture). False si URL vide / désactivé / filtré."""
+    if not _webhook_url or _webhook_disabled:
+        return False
+    if event != 'test' and event not in _webhook_events:
+        return False
+    return _post_webhook(event, data, timeout_cap=timeout)
 
 # ── Command dispatch ──────────────────────────────────────────────────────────
 def _cmd_list_windows(cmd, rid):
@@ -956,17 +1492,7 @@ def _cmd_vlm_ask(cmd, rid):
         except Exception as e:
             _reply(rid, False, error=str(e))
         finally:
-            # ask_region capture l'écran via screen_reader, qui garde une
-            # instance mss THREAD-LOCALE. Ce thread est jetable (un par appel,
-            # jusqu'à ~12 par cycle Auto Bouffe) : sans ça chaque appel laisse
-            # un DC/DIB GDI derrière lui et une session de farm de plusieurs
-            # heures épuise les handles du process. Même motif que
-            # macro_runner._run() en fin de thread.
-            try:
-                from modules.engine.screen_reader import release_thread_sct
-                release_thread_sct()
-            except Exception:
-                pass
+            _release_sct()  # thread jetable — libérer son instance mss (fuite GDI sinon)
     threading.Thread(target=_run, daemon=True, name='vlm-ask').start()
 
 def _cmd_vlm_warmup(cmd, rid):
@@ -983,21 +1509,41 @@ def _cmd_test_condition(cmd, rid):
     from modules.engine.conditions import eval_condition
     _reply(rid, True, result=eval_condition(cmd))
 
+_test_action_stops: set = set()   # _stop Events des exec_action de test en cours — stop_all les set
+_test_action_lock = threading.Lock()
+
 def _cmd_exec_action(cmd, rid):
+    """Exécute une action de test dans un thread dédié (une action longue —
+    wait, key_hold — ne bloque plus la boucle stdin, donc stop_all/macro_stop
+    restent traités). Le thread répond lui-même, une seule fois, avec `rid`."""
     from modules.engine.actions import exec_action
     _pl = threading.Event(); _pl.set()
+    _stop = threading.Event()
     ctx = {
         'on_webhook':     _send_webhook,
         'on_log':         lambda msg, lvl: _send({'type': 'log', 'level': lvl, 'msg': msg}),
         'on_macro_start': lambda name: _send({'type': 'macro_start_request', 'name': name}),
         'on_macro_stop':  lambda name: None,
         'stop_self':      lambda: None,
-        '_stop':          threading.Event(),
+        '_stop':          _stop,
         '_pause_lock':    _pl,
         '_humanize':      False,
         '_humanize_factor': 0.12,
     }
-    exec_action(cmd, ctx); _reply(rid, True)
+
+    def _run():
+        try:
+            exec_action(cmd, ctx)
+            _reply(rid, True)
+        except Exception as e:
+            _reply(rid, False, error=str(e))
+        finally:
+            with _test_action_lock:
+                _test_action_stops.discard(_stop)
+            _release_sct()
+    with _test_action_lock:
+        _test_action_stops.add(_stop)   # avant start() : un stop_all immédiat l'atteint
+    threading.Thread(target=_run, daemon=True, name='test-exec-action').start()
 
 def _cmd_macro_start(cmd, rid):
     from modules.engine.macro_runner import MacroRunner
@@ -1053,6 +1599,7 @@ def _cmd_macro_start(cmd, rid):
         on_webhook=on_webhook,
         on_macro_start=on_macro_start_cb,
         on_macro_stop=on_macro_stop_cb,
+        on_finish=_send_status,
     )
     with _runners_lock:
         _runners[macro_id] = runner
@@ -1079,11 +1626,38 @@ def _cmd_macro_resume(cmd, rid):
     if r: r.resume(); _reply(rid, True)
     else: _reply(rid, False, error='Not running')
 
-def _cmd_stop_all(cmd, rid):
+def _release_held_keys():
+    """Relâche les touches maintenues si actions.py expose le helper (ajout
+    en cours ailleurs — getattr pour fonctionner avec ou sans)."""
+    actions = sys.modules.get('modules.engine.actions')
+    fn = getattr(actions, 'release_all_held_keys', None) if actions else None
+    if fn:
+        try:
+            fn()
+        except Exception as e:
+            logging.getLogger('engine').warning(f'release_all_held_keys: {e}')
+
+def _stop_everything(join_timeout: float = 0.0):
+    """Logique commune stop_all / EOF stdin : stoppe tous les runners et
+    les exec_action de test, puis relâche les touches maintenues."""
     with _runners_lock:
         runners = list(_runners.values())
         _runners.clear()
-    for r in runners: r.stop()
+    with _test_action_lock:
+        for ev in _test_action_stops: ev.set()
+    threads = []
+    for r in runners:
+        t = getattr(r, '_thread', None)
+        r.stop()
+        if t is not None: threads.append(t)
+    if join_timeout > 0:
+        deadline = time.time() + join_timeout
+        for t in threads:
+            t.join(max(0.0, deadline - time.time()))
+    _release_held_keys()
+
+def _cmd_stop_all(cmd, rid):
+    _stop_everything()
     _reply(rid, True); _send_status()
 
 def _cmd_status(cmd, rid):
@@ -1139,7 +1713,9 @@ def _cmd_ocr_text(cmd, rid):
             _ocrmod._DEBUG_OCR = False
 
 def _cmd_set_webhook(cmd, rid):
-    global _webhook_url, _webhook_fail_count, _webhook_disabled, _webhook_events, _webhook_debug_screenshot
+    global _webhook_url, _webhook_fail_count, _webhook_disabled, _webhook_events
+    global _debug_webhook_url, _debug_consent, _debug_fail_count, _debug_disabled
+    global _webhook_mention_id, _webhook_error_threshold, _webhook_alert_screenshot, _webhook_session_on_exit
     new_url = cmd.get('url', '')
     if new_url != _webhook_url:
         with _webhook_lock:
@@ -1151,8 +1727,30 @@ def _cmd_set_webhook(cmd, rid):
     events = cmd.get('events')
     if events is not None:
         _webhook_events = set(events)
-    if 'debug_screenshot' in cmd:
-        _webhook_debug_screenshot = bool(cmd['debug_screenshot'])
+    if 'debug_url' in cmd:
+        new_debug = str(cmd['debug_url'] or '')
+        if new_debug != _debug_webhook_url:
+            with _debug_lock:
+                _debug_fail_count = 0
+                _debug_disabled   = False
+        _debug_webhook_url = new_debug
+    # debug_screenshot = ancien nom (alias) de debug_consent
+    if 'debug_consent' in cmd:
+        _debug_consent = bool(cmd['debug_consent'])
+    elif 'debug_screenshot' in cmd:
+        _debug_consent = bool(cmd['debug_screenshot'])
+    if 'mention_id' in cmd:
+        m = str(cmd['mention_id'] or '').strip()
+        _webhook_mention_id = m if m.isdigit() else ''
+    if 'error_threshold' in cmd:
+        try:
+            _webhook_error_threshold = max(1, int(cmd['error_threshold']))
+        except (TypeError, ValueError):
+            pass
+    if 'alert_screenshot' in cmd:
+        _webhook_alert_screenshot = bool(cmd['alert_screenshot'])
+    if 'session_on_exit' in cmd:
+        _webhook_session_on_exit = bool(cmd['session_on_exit'])
     _reply(rid, True, disabled=_webhook_disabled)
 
 def _cmd_set_license_key(cmd, rid):
@@ -1181,13 +1779,14 @@ _WEBHOOK_STATUS_MSG = {
     'event_filtered': "Cet event n'est pas coché dans les événements déclencheurs.",
     'disabled':       "Webhook désactivé (trop d'échecs 403) — vérifie/corrige l'URL.",
     'rate_limited':   "Envoi ignoré — trop rapproché du précédent (limite 2s).",
+    'queued':         "Envoi différé (limite 2s) — partira dans un instant.",
 }
 
 def _cmd_send_webhook(cmd, rid):
     event  = cmd.get('event', 'manual')
     data   = cmd.get('data', {})
     status = _send_webhook(event, data)
-    if status == 'sent':
+    if status in ('sent', 'queued'):
         _reply(rid, True)
     else:
         _reply(rid, False, error=_WEBHOOK_STATUS_MSG.get(status, f'Non envoyé ({status})'))
@@ -1353,6 +1952,168 @@ def _cmd_find_window_monitor(cmd, rid):
         _reply(rid, True, monitor=mon)
     else:
         _reply(rid, False, error='Fenêtre introuvable ou aucun moniteur détecté')
+
+# ── Surveillance (jeu fermé / erreurs) + résumé de session ─────────────────────
+def _error_tier_crossed(prev_tier: int, errors: int, threshold: int) -> tuple[bool, int]:
+    """Palier d'erreurs = errors // threshold. Alerte si le palier augmente."""
+    threshold = max(1, int(threshold))
+    tier = max(0, int(errors)) // threshold
+    return tier > prev_tier, tier
+
+
+def _game_transition(seen_before: bool, running_now: bool, active: bool) -> tuple[bool, bool]:
+    """Renvoie (alert, seen_now). Alerte quand le jeu a été vu puis disparaît
+    pendant que des macros/Auto Bouffe sont actifs. Jamais vu -> jamais d'alerte.
+    `seen_now` repasse à False après l'alerte (réarmé au retour du jeu)."""
+    if running_now:
+        return False, True
+    if not active:
+        return False, False  # jeu fermé au repos : on réarme, pas d'alerte
+    if seen_before and active:
+        return True, False
+    return False, seen_before
+
+
+def _fivem_running() -> bool:
+    import psutil
+    for p in psutil.process_iter(['name']):
+        try:
+            if 'fivem' in (p.info.get('name') or '').lower():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _watch_tick(state_mem: dict) -> None:
+    """Un cycle de surveillance (isolé pour être testable)."""
+    with _runners_lock:
+        runners = list(_runners.items())
+    running = [(mid, r) for mid, r in runners if r.is_running()]
+    active = bool(running) or _abf_running
+
+    # Jeu fermé
+    if active:
+        now_run = _fivem_running()
+        alert, state_mem['seen'] = _game_transition(state_mem.get('seen', False), now_run, active)
+        if alert:
+            names = [(r.macro.get('name') or mid) for mid, r in running]
+            _send_webhook('game_closed', {
+                'message': 'Plus aucun processus FiveM détecté',
+                'active_macros': ', '.join(names) if names else ('Auto Bouffe' if _abf_running else ''),
+            })
+            _send({'type': 'alert', 'event': 'game_closed', 'title': 'FiveM fermé',
+                   'message': 'Plus aucun processus FiveM détecté'})
+    else:
+        state_mem['seen'] = False  # au repos : réarme, pas de polling psutil
+
+    # Erreurs par macro
+    tiers = state_mem.setdefault('tiers', {})
+    live_ids = set()
+    for mid, r in running:
+        live_ids.add(mid)
+        st = r.get_stats() or {}
+        errs = int(st.get('errors', 0) or 0)
+        crossed, tiers[mid] = _error_tier_crossed(tiers.get(mid, 0), errs, _webhook_error_threshold)
+        if crossed:
+            _send_webhook('macro_errors', {
+                'macro': r.macro.get('name') or mid,
+                'errors': errs,
+                'threshold': _webhook_error_threshold,
+            })
+            _send({'type': 'alert', 'event': 'macro_errors', 'title': r.macro.get('name') or mid,
+                   'message': f'{errs} erreurs'})
+    for mid in list(tiers):
+        if mid not in live_ids:
+            del tiers[mid]
+
+
+def _alert_watch():
+    mem: dict = {}
+    while True:
+        time.sleep(10)
+        try:
+            _watch_tick(mem)
+        except Exception as e:
+            _webhook_log.debug(f'alert-watch: {e}')
+
+
+def _fmt_int(n) -> str:
+    return f'{int(n or 0):,}'.replace(',', ' ')
+
+
+def _fmt_dur(sec) -> str:
+    sec = int(sec or 0)
+    h, m = sec // 3600, (sec % 3600) // 60
+    return f'{h} h {m:02d}' if h else f'{m} min'
+
+
+def _session_summary_data(snap: dict | None) -> dict | None:
+    """Données du webhook session_summary, ou None si la session est trop
+    courte (< 300 s) et sans cycle, ou vide."""
+    if not snap:
+        return None
+    dur = float(snap.get('durationS') or 0)
+    cycles = int(snap.get('cycles') or 0)
+    if dur < 300 and cycles == 0:
+        return None
+    errors = int(snap.get('errors') or 0)
+    lines = [
+        f'Durée : {_fmt_dur(dur)}',
+        f'Cycles : {_fmt_int(cycles)}',
+        f'Erreurs : {_fmt_int(errors)}',
+    ]
+    abf = snap.get('abf') or {}
+    if any(abf.get(k) for k in ('meals', 'mealFails', 'trunkReopened', 'trunkFails')):
+        lines.append(
+            f"Auto Bouffe : {_fmt_int(abf.get('meals'))} repas, "
+            f"{_fmt_int(abf.get('mealFails'))} échec, "
+            f"{_fmt_int(abf.get('trunkReopened'))} coffres rouverts"
+        )
+    for m in snap.get('macros') or []:
+        e = int(m.get('errors') or 0)
+        lines.append(
+            f"• {m.get('name', '?')} — {_fmt_int(m.get('cycles'))} cycles, "
+            f"{_fmt_int(e)} erreur{'s' if e > 1 else ''}, {_fmt_dur(m.get('activeS'))} actif"
+        )
+    return {
+        'message': f'Session terminée — {_fmt_dur(dur)}, {_fmt_int(cycles)} cycles, {_fmt_int(errors)} erreurs',
+        'summary_lines': lines,
+        'duration_s': int(dur),
+        'cycles': cycles,
+        'errors': errors,
+    }
+
+
+def _cmd_set_session_snapshot(cmd, rid):
+    global _session_snapshot, _abf_running
+    snap = cmd.get('snapshot')
+    with _session_lock:
+        if isinstance(snap, dict):
+            _session_snapshot = snap
+        _abf_running = bool(cmd.get('abf_running'))
+    _reply(rid, True)
+
+
+def _cmd_session_shutdown(cmd, rid):
+    """Arrête tout (comme stop_all) puis envoi synchrone du résumé de session
+    (l'app est en train de fermer : plus aucune entrée ne doit partir)."""
+    sent = False
+    try:
+        _stop_everything()
+    except Exception as e:
+        _webhook_log.debug(f'session_shutdown stop: {e}')
+    try:
+        with _session_lock:
+            snap = dict(_session_snapshot)
+        if _webhook_session_on_exit:
+            data = _session_summary_data(snap)
+            if data is not None:
+                sent = bool(_send_webhook_sync('session_summary', data, timeout=5.0))
+    except Exception as e:
+        _webhook_log.debug(f'session_shutdown: {e}')
+    _reply(rid, True, sent=sent)
+
 
 def _cmd_get_stats(cmd, rid):
     """Retourne les stats d'exécution d'une macro ou de toutes les macros."""
@@ -1535,6 +2296,8 @@ _DISPATCH = {
     'check_ocr':            _cmd_check_ocr,
     'ocr_text':             _cmd_ocr_text,
     'set_webhook':          _cmd_set_webhook,
+    'set_session_snapshot': _cmd_set_session_snapshot,
+    'session_shutdown':     _cmd_session_shutdown,
     'set_license_key':      _cmd_set_license_key,
     'send_webhook':         _cmd_send_webhook,
     'test_template_score':  _cmd_test_template_score,
@@ -1554,6 +2317,7 @@ def _handle(cmd: dict):
 if __name__ == '__main__':
     _init_condition_registry()   # donne aux conditions l'accès aux runners
     threading.Thread(target=_ram_monitor, daemon=True, name='ram-monitor').start()
+    threading.Thread(target=_alert_watch, daemon=True, name='alert-watch').start()
     # _prewarm_ocr() retiré : un crash natif (torch quantized RNN, access
     # violation) dans ce préchargement tue tout le process — pas juste le
     # thread OCR — puisque ce sont des threads Python dans le même process,
@@ -1568,8 +2332,16 @@ if __name__ == '__main__':
         if not raw: continue
         try:   cmd = json.loads(raw)
         except json.JSONDecodeError:
-            _send({'type': 'log', 'level': 'WARNING', 'msg': f'Bad JSON: {raw}'}); continue
+            # pas la ligne brute : elle peut contenir une api_key (vlm_ask)
+            _send({'type': 'log', 'level': 'WARNING',
+                   'msg': f'Bad JSON ({len(raw)} car.): {raw[:40]!r}'}); continue
         try:   _handle(cmd)
         except Exception as e:
             _reply(cmd.get('id', ''), False, error=str(e))
+    # EOF stdin = Electron mort : arrêter proprement les runners (pre_stop_actions,
+    # touches maintenues) au lieu de sortir en laissant des touches enfoncées.
+    try:
+        _stop_everything(join_timeout=3.0)
+    except Exception:
+        pass
 

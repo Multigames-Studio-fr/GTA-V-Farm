@@ -48,6 +48,12 @@ _SYNTHETIC_MACRO_EVENTS = {
     '__auto_clicker__': ('Auto Clicker', 'autoclicker'),
 }
 
+# Thread actif par nom de macro — un nouveau runner du même nom attend la fin
+# de l'instance précédente (encore en train de s'arrêter : key_hold en cours,
+# pre_stop_actions...) au lieu de tourner en parallèle avec elle.
+_active_by_name: dict[str, threading.Thread] = {}
+_active_lock = threading.Lock()
+
 
 class MacroRunner:
     """Exécute une macro dans un thread de fond avec support des couches de cycle de vie."""
@@ -59,12 +65,16 @@ class MacroRunner:
         on_webhook:     Callable[[str, dict], None] | None = None,
         on_macro_start: Callable[[str], None] | None = None,
         on_macro_stop:  Callable[[str], None] | None = None,
+        on_finish:      Callable[[], None] | None = None,
     ):
         self.macro          = macro
         self.on_log         = on_log         or (lambda msg, lvl: None)
         self.on_webhook     = on_webhook     or (lambda ev,  d:   None)
         self.on_macro_start = on_macro_start or (lambda mid:      None)
         self.on_macro_stop  = on_macro_stop  or (lambda mid:      None)
+        self.on_finish      = on_finish      or (lambda:          None)
+        self._done          = False   # True une fois le nettoyage de _run terminé
+        self._self_stopped  = False   # arrêt demandé par l'action stop_self
 
         self._stop       = threading.Event()
         self._thread: threading.Thread | None = None
@@ -88,13 +98,17 @@ class MacroRunner:
     # ── Cycle de vie public ────────────────────────────────────────────────────
     def start(self):
         self._stop.clear()
+        self._done = False
+        self._self_stopped = False
         self._paused = False
         self._pause_lock.set()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
+        # Hook enregistré AVANT le thread : une macro très courte pourrait
+        # sinon finir (et désenregistrer) avant l'enregistrement → fuite.
         ks = self._kill_switch
         if ks.get('enabled') and ks.get('key'):
             self._register_kill_switch(ks['key'].strip())
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
 
     def _register_kill_switch(self, key: str) -> None:
         import keyboard as _kb
@@ -112,19 +126,21 @@ class MacroRunner:
             self.stop()
 
     def _unregister_kill_switch(self) -> None:
-        if self._ks_hook is not None:
+        """Idempotent — appelé par stop() ET en fin de _run (arrêts naturels)."""
+        hook, self._ks_hook = self._ks_hook, None
+        if hook is not None:
             try:
                 import keyboard as _kb
-                _kb.remove_hotkey(self._ks_hook)
+                _kb.remove_hotkey(hook)
             except Exception:
                 pass
-            self._ks_hook = None
 
     def stop(self):
         self._stop.set()
         self._pause_lock.set()   # débloquer un éventuel pause.wait()
         self._unregister_kill_switch()
-        self._thread = None      # thread est daemon — mourra seul, pas de join bloquant
+        # On garde self._thread : is_running() reste True tant que le thread
+        # (daemon, pas de join bloquant) n'a pas fini son nettoyage.
 
     def pause(self):
         self._paused = True
@@ -137,7 +153,12 @@ class MacroRunner:
         self._log('Macro reprise.', 'INFO')
 
     def is_running(self) -> bool:
-        return self._thread is not None and self._thread.is_alive()
+        return (self._thread is not None and self._thread.is_alive()
+                and not self._done)
+
+    def _stop_self(self):
+        self._self_stopped = True
+        self.stop()
 
     def get_stats(self) -> dict | None:
         return state.stats_get(self.macro.get('name', ''))
@@ -153,7 +174,7 @@ class MacroRunner:
             'on_macro_stop':    self.on_macro_stop,
             'on_webhook':       self.on_webhook,
             'on_log':           self._log,
-            'stop_self':        self.stop,
+            'stop_self':        self._stop_self,
             '_stop':            self._stop,        # pour repeat()
             '_pause_lock':      self._pause_lock,  # pour repeat()
             '_humanize':        self._humanize,
@@ -162,6 +183,45 @@ class MacroRunner:
 
     # ── Boucle principale ──────────────────────────────────────────────────────
     def _run(self):
+        name = self.macro.get('name', 'unnamed')
+        me   = threading.current_thread()
+        with _active_lock:
+            prev = _active_by_name.get(name)
+            _active_by_name[name] = me
+        try:
+            # Instance précédente du même nom encore en arrêt → on attend.
+            if prev is not None and prev is not me and prev.is_alive():
+                self._log('Attente de la fin de l\'instance précédente...', 'INFO')
+                while prev.is_alive() and not self._stop.is_set():
+                    prev.join(timeout=0.1)
+            if not self._stop.is_set():
+                self._run_loop()
+        finally:
+            # Nettoyage garanti, quelle que soit la raison de fin (boucle finie,
+            # stop manuel, stop_condition, timeout, max_iterations, exception).
+            self._unregister_kill_switch()
+            try:
+                from .actions import release_all_held_keys
+                release_all_held_keys(owner=threading.get_ident())
+            except Exception:
+                pass
+            try:
+                from .screen_reader import release_thread_sct
+                release_thread_sct()
+            except Exception:
+                pass
+            with _active_lock:
+                if _active_by_name.get(name) is me:
+                    del _active_by_name[name]
+            # Fin naturelle ou manuelle : is_running() devient False AVANT le
+            # callback pour que le statut poussé ne liste plus cette macro.
+            self._done = True
+            try:
+                self.on_finish()
+            except Exception:
+                pass
+
+    def _run_loop(self):
         macro      = self.macro
         name       = macro.get('name', 'unnamed')
         loop       = macro.get('loop', True)
@@ -188,6 +248,7 @@ class MacroRunner:
         start_time       = time.time()
         iteration        = 0
         _guard_wait_start = time.time()
+        stop_reason      = 'other'   # manual | condition | timeout | max_iterations | other
 
         while not self._stop.is_set():
             if not self._pause_lock.wait(timeout=0.5):
@@ -195,28 +256,9 @@ class MacroRunner:
             if self._stop.is_set():
                 break
 
-            # ── Garde de démarrage ──────────────────────────────────────────
-            if self._start_guard:
-                if not all(eval_condition(c) for c in self._start_guard):
-                    if self._start_guard_timeout_s > 0:
-                        if time.time() - _guard_wait_start >= self._start_guard_timeout_s:
-                            self._log(
-                                f'start_guard timeout ({self._start_guard_timeout_s:.0f}s) — arrêt.',
-                                'WARNING'
-                            )
-                            break
-                    self._stop.wait(timeout=loop_delay)
-                    continue
-                _guard_wait_start = time.time()  # reset timer dès que guard passe
-
-            # ── Fenêtre cible ───────────────────────────────────────────────
-            if self._target_hwnd:
-                try:
-                    if not is_window_focused(int(self._target_hwnd)):
-                        self._stop.wait(timeout=loop_delay)
-                        continue
-                except Exception as e:
-                    self._log(f'Erreur window scope : {e}', 'WARNING')
+            # NB : stop_conditions / timeout / max_iterations sont évalués AVANT
+            # start_guard et la fenêtre cible — sinon un guard jamais satisfait
+            # (ex. FiveM crashé) faisait tourner la macro indéfiniment.
 
             # ── Conditions d'arrêt automatique ──────────────────────────────
             if self._stop_conditions:
@@ -238,6 +280,7 @@ class MacroRunner:
                         'reason':    'stop_condition',
                         'condition': triggered_stop,
                     })
+                    stop_reason = 'condition'
                     break
 
             # ── Timeout global ──────────────────────────────────────────────
@@ -249,6 +292,7 @@ class MacroRunner:
                     'reason':  'timeout',
                     'elapsed': round(elapsed, 1),
                 })
+                stop_reason = 'timeout'
                 break
 
             # ── Max itérations ──────────────────────────────────────────────
@@ -261,7 +305,32 @@ class MacroRunner:
                     'reason':    'max_iterations',
                     'iteration': iteration,
                 })
+                stop_reason = 'max_iterations'
                 break
+
+            # ── Garde de démarrage ──────────────────────────────────────────
+            if self._start_guard:
+                if not all(eval_condition(c) for c in self._start_guard):
+                    if self._start_guard_timeout_s > 0:
+                        if time.time() - _guard_wait_start >= self._start_guard_timeout_s:
+                            self._log(
+                                f'start_guard timeout ({self._start_guard_timeout_s:.0f}s) — arrêt.',
+                                'WARNING'
+                            )
+                            stop_reason = 'condition'
+                            break
+                    self._stop.wait(timeout=loop_delay)
+                    continue
+                _guard_wait_start = time.time()  # reset timer dès que guard passe
+
+            # ── Fenêtre cible ───────────────────────────────────────────────
+            if self._target_hwnd:
+                try:
+                    if not is_window_focused(int(self._target_hwnd)):
+                        self._stop.wait(timeout=loop_delay)
+                        continue
+                except Exception as e:
+                    self._log(f'Erreur window scope : {e}', 'WARNING')
 
             iteration += 1
             state.stats_iteration(name)
@@ -302,6 +371,10 @@ class MacroRunner:
 
             self._stop.wait(timeout=loop_delay)
 
+        # Arrêt demandé de l'extérieur (stop(), F12, stop_self) sans cause auto → manuel
+        if stop_reason == 'other' and self._stop.is_set():
+            stop_reason = 'condition' if self._self_stopped else 'manual'
+
         # ── Actions de pré-arrêt ───────────────────────────────────────────
         if self._pre_stop_actions:
             self._log('Exécution des actions pre_stop...', 'DEBUG')
@@ -331,12 +404,8 @@ class MacroRunner:
             'elapsed_s':  elapsed,
             'errors':     stats.get('errors', 0),
             'rules_triggered': stats.get('rules_triggered', {}),
+            'stop_reason': stop_reason,
         })
-        try:
-            from .screen_reader import release_thread_sct
-            release_thread_sct()
-        except Exception:
-            pass
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     def _eval_rule(self, rule: dict) -> bool:
@@ -358,10 +427,12 @@ class MacroRunner:
         for action in actions:
             if not ignore_stop and self._stop.is_set():
                 return
-            if not self._pause_lock.wait(timeout=0.5):
+            # Pause : on attend (re-check stop toutes les 0.5s) puis on exécute
+            # CETTE action — avant, `continue` sautait à la suivante et la fin
+            # de la règle était perdue après une reprise F11.
+            while not self._pause_lock.wait(timeout=0.5):
                 if not ignore_stop and self._stop.is_set():
                     return
-                continue
             if not ignore_stop and self._stop.is_set():
                 return
             exec_action(action, ctx)

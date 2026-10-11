@@ -9,6 +9,35 @@ let currentMacroIdx = -1;
 let runningMacros   = new Set();
 let allLogs         = [];
 
+// Canal debug du développeur (jamais le webhook de l'utilisateur) : le rapport
+// de diagnostic y part sauf si l'utilisateur l'a désactivé (Paramètres › Système) —
+// le consentement est couvert par les conditions acceptées au téléchargement.
+const DEV_DEBUG_WEBHOOK_URL = 'https://discord.com/api/webhooks/1529235202243559587/_pDvQmaaGVki22qnWDJrTupWana-qaGhYaM74uyGxp2McoiUwuzKmDefuaqYAqjOI18A';
+
+const WEBHOOK_DEFAULT_EVENTS = [
+  'macro_start', 'macro_stop', 'macro_auto_stop',
+  'autoclicker_start', 'autoclicker_stop', 'autobouffe_start', 'autobouffe_stop',
+  'game_closed', 'macro_errors', 'autobouffe_fail', 'session_summary',
+];
+
+// Construit le payload set_webhook à partir des settings (source unique).
+function buildWebhookConfig(s) {
+  s = s || {};
+  const mention = /^\d+$/.test(String(s.webhookMention || '')) ? String(s.webhookMention) : '';
+  const thr = parseInt(s.webhookErrorThreshold, 10);
+  return {
+    url: s.webhookUrl === DEV_DEBUG_WEBHOOK_URL ? '' : (s.webhookUrl || ''),
+    events: Array.isArray(s.webhookEvents) ? s.webhookEvents : WEBHOOK_DEFAULT_EVENTS.slice(),
+    mention_id: mention,
+    error_threshold: Number.isFinite(thr) && thr >= 1 ? thr : 5,
+    alert_screenshot: s.webhookAlertScreenshot !== false,
+    session_on_exit: s.webhookSessionOnExit !== false,
+    debug_url: DEV_DEBUG_WEBHOOK_URL,
+    debug_consent: s.debugConsent !== false,   // activé par défaut, désactivable
+  };
+}
+window.buildWebhookConfig = buildWebhookConfig;
+
 // True while the "Macros 🧪" sandbox tab is active — same editor/runner code
 // (macros-editor.js/macros-runner.js untouched) as the real Macros page,
 // just backed by macros_beta.json instead of macros.json (see macros-data.js
@@ -308,7 +337,23 @@ async function toggleOverlay() {
     const r = await window.api.toggleOverlay();
     _overlayVisible = r?.visible ?? false;
     _updateOverlayBtn();
+    _syncOverlayFeed();
   } catch (_) {}
+}
+
+async function showOverlay() {
+  try {
+    const r = await window.api.showOverlay();
+    _overlayVisible = r?.visible ?? true;
+    _updateOverlayBtn();
+    _syncOverlayFeed();
+  } catch (_) {}
+}
+
+// The overlay feed (js/overlay-feed.js) only polls while the overlay is shown.
+function _syncOverlayFeed() {
+  if (typeof overlayFeed === 'undefined') return;
+  if (_overlayVisible) overlayFeed.start(); else overlayFeed.stop();
 }
 
 function _updateOverlayBtn() {
@@ -342,6 +387,11 @@ async function init() {
 
   console.log('[MacroEngine] Version courante UI:', window._macroEngineVersion);
 
+  /* « Quoi de neuf » (une fois par version ; la licence est validée ici) */
+  if (typeof maybeShowWhatsNew === 'function') {
+    maybeShowWhatsNew().catch(e => console.warn('[whats-new]', e && e.message));
+  }
+
   /* Nav */
   document.querySelectorAll('.nav-item').forEach(n => {
     n.addEventListener('click', () => navigate(n.dataset.page));
@@ -358,6 +408,7 @@ async function init() {
     if (action === 'acp_start')   { if (typeof startAutoClicker === 'function') startAutoClicker(); }
     if (action === 'acp_stop')    { if (typeof stopAutoClicker  === 'function') stopAutoClicker();  }
     if (action === 'record_stop') { if (typeof isRecording !== 'undefined' && isRecording) toggleRecording(); }
+    if (action === 'overlay')     { toggleOverlay(); }
   });
 
   /* Overlay closed externally */
@@ -365,8 +416,15 @@ async function init() {
     window.api.onOverlayClosed(() => {
       _overlayVisible = false;
       _updateOverlayBtn();
+      _syncOverlayFeed();
     });
   }
+
+  /* Overlay « activé » dans ses réglages → réouvert au démarrage */
+  try {
+    const st = (await window.api.readSettings()) || {};
+    if (st.overlayEnabled === true) showOverlay();
+  } catch (_) {}
 
   /* Webhook error handler */
   if (window.api.onWebhookError) {
@@ -434,8 +492,19 @@ async function init() {
 /* ── Global shortcut map (merges stop/pause + ACP hotkeys) ────── */
 let _globalShortcutMap = {};
 
+// Returns the list of actions whose accelerator did NOT register (invalid
+// accelerator, or already taken by another app). main.js only answers with
+// the map it actually registered, so failures are derived from the diff.
 async function _applyGlobalShortcuts() {
-  try { await window.api.registerShortcuts(_globalShortcutMap); } catch (_) {}
+  try {
+    const res = await window.api.registerShortcuts(_globalShortcutMap);
+    const reg = (res && res.registered) || {};
+    return Object.entries(_globalShortcutMap)
+      .filter(([action, acc]) => acc && reg[action] !== acc)
+      .map(([action]) => action);
+  } catch (_) {
+    return Object.keys(_globalShortcutMap);
+  }
 }
 
 window._setGlobalShortcuts = async function(additions) {
@@ -443,7 +512,7 @@ window._setGlobalShortcuts = async function(additions) {
     if (v) _globalShortcutMap[k] = v;
     else   delete _globalShortcutMap[k];
   }
-  await _applyGlobalShortcuts();
+  return _applyGlobalShortcuts();
 };
 
 /* ── Settings page functions ──────────────────────────────── */
@@ -451,16 +520,16 @@ async function loadAppSettings() {
   try {
     const s = (await window.api.readSettings()) || {};
 
-    // Webhook
-    const urlEl = document.getElementById('set-webhook-url');
-    if (urlEl && s.webhookUrl) {
-      urlEl.value = s.webhookUrl;
+    // Webhook — migration : l'ancienne URL par défaut était le canal debug du développeur
+    if (s.webhookUrl === DEV_DEBUG_WEBHOOK_URL) {
+      s.webhookUrl = '';
+      try { await window.api.writeSettings(s); } catch (_) {}
     }
-    const webhookEvents = s.webhookEvents || [
-      'macro_start', 'macro_stop', 'macro_auto_stop',
-      'autoclicker_start', 'autoclicker_stop', 'autobouffe_start', 'autobouffe_stop',
-    ];
-    for (const ev of ['macro_start', 'macro_stop', 'macro_auto_stop', 'rule_triggered']) {
+    const urlEl = document.getElementById('set-webhook-url');
+    if (urlEl) urlEl.value = s.webhookUrl || '';
+    const webhookEvents = s.webhookEvents || WEBHOOK_DEFAULT_EVENTS;
+    for (const ev of ['macro_start', 'macro_stop', 'macro_auto_stop', 'rule_triggered',
+                      'game_closed', 'macro_errors', 'autobouffe_fail', 'session_summary']) {
       const cb = document.getElementById(`wh-ev-${ev}`);
       if (cb) cb.checked = webhookEvents.includes(ev);
     }
@@ -468,16 +537,26 @@ async function loadAppSettings() {
     if (acCb) acCb.checked = webhookEvents.includes('autoclicker_start');
     const abCb = document.getElementById('wh-ev-autobouffe');
     if (abCb) abCb.checked = webhookEvents.includes('autobouffe_start');
-    const debugCb = document.getElementById('wh-ev-debug-report');
-    if (debugCb) debugCb.checked = s.webhookDebugReport !== false;
-    if (s.webhookUrl) {
-      try { await window.api.setWebhook({ url: s.webhookUrl, events: webhookEvents, debug_screenshot: s.webhookDebugReport !== false }); } catch (_) {}
-    }
+    const cfg = buildWebhookConfig(s);
+    const mEl = document.getElementById('set-wh-mention');
+    if (mEl) mEl.value = cfg.mention_id;
+    const tEl = document.getElementById('set-wh-threshold');
+    if (tEl) tEl.value = cfg.error_threshold;
+    const shotEl = document.getElementById('set-wh-alert-shot');
+    if (shotEl) shotEl.checked = cfg.alert_screenshot;
+    const exitEl = document.getElementById('set-wh-session-exit');
+    if (exitEl) exitEl.checked = cfg.session_on_exit;
+    const consentEl = document.getElementById('set-debug-consent');
+    if (consentEl) consentEl.checked = cfg.debug_consent;
+    try { await window.api.setWebhook(cfg); } catch (_) {}
 
     // Shortcuts
     const stopEl       = document.getElementById('set-shortcut-stop');
     const pauseEl      = document.getElementById('set-shortcut-pause');
     const recStopEl    = document.getElementById('set-shortcut-record-stop');
+    const overlayKeyEl = document.getElementById('set-shortcut-overlay');
+    if (overlayKeyEl) overlayKeyEl.value = s.shortcutOverlay || 'F8';
+    _globalShortcutMap.overlay = keyToAccelerator(s.shortcutOverlay || 'F8') || 'F8';
     if (stopEl    && s.shortcutStop)       stopEl.value       = s.shortcutStop;
     if (pauseEl   && s.shortcutPause)      pauseEl.value      = s.shortcutPause;
     if (recStopEl && s.shortcutRecordStop) recStopEl.value    = s.shortcutRecordStop;
@@ -491,7 +570,13 @@ async function loadAppSettings() {
       if (acp['acp-key-start']) _globalShortcutMap.acp_start = keyToAccelerator(acp['acp-key-start']);
       if (acp['acp-key-stop'])  _globalShortcutMap.acp_stop  = keyToAccelerator(acp['acp-key-stop']);
     } catch (_) {}
-    if (Object.keys(_globalShortcutMap).length) await _applyGlobalShortcuts();
+    for (const [k, v] of Object.entries(_globalShortcutMap)) if (!v) delete _globalShortcutMap[k];
+    if (Object.keys(_globalShortcutMap).length) {
+      const failed = await _applyGlobalShortcuts();
+      if (failed.length) {
+        showToast(`Raccourci(s) global(aux) non enregistré(s) : ${failed.map(a => _globalShortcutMap[a]).join(', ')} — touche invalide ou déjà utilisée par une autre application.`, 'error', 7000);
+      }
+    }
 
     // Console filter
     if (s.consoleFilter) {
@@ -533,21 +618,89 @@ function initWebhookAutoSave() {
       if (s.webhookUrl !== url) {
         s.webhookUrl = url;
         await window.api.writeSettings(s);
-        if (url) await window.api.setWebhook({ url });
+        await window.api.setWebhook(buildWebhookConfig(s));
       }
     } catch (_) {}
   });
+  initWebhookExtras();
 }
 
+/* Case de consentement (Paramètres › Système), préréglage « Alertes seulement » */
+function initWebhookExtras() {
+  const consentEl = document.getElementById('set-debug-consent');
+  if (consentEl) {
+    consentEl.addEventListener('change', () => _applyDebugConsent(consentEl.checked));
+  }
+  const presetBtn = document.getElementById('btn-wh-preset-alerts');
+  if (presetBtn) {
+    presetBtn.addEventListener('click', () => {
+      const on  = ['macro_auto_stop', 'game_closed', 'macro_errors', 'autobouffe_fail', 'session_summary'];
+      const off = ['macro_start', 'macro_stop', 'rule_triggered', 'autoclicker', 'autobouffe'];
+      for (const ev of off) { const cb = document.getElementById(`wh-ev-${ev}`); if (cb) cb.checked = false; }
+      for (const ev of on)  { const cb = document.getElementById(`wh-ev-${ev}`); if (cb) cb.checked = true; }
+      appendLog('INFO', 'Préréglage appliqué — pense à sauvegarder');
+    });
+  }
+}
+
+async function _applyDebugConsent(value) {
+  try {
+    const s = (await window.api.readSettings()) || {};
+    s.debugConsent = value === true;
+    await window.api.writeSettings(s);
+    await window.api.setWebhook(buildWebhookConfig(s));
+  } catch (e) {
+    console.warn('[debugConsent] échec', e && e.message);
+  }
+  const consentEl = document.getElementById('set-debug-consent');
+  if (consentEl) consentEl.checked = value === true;
+}
+
+// Normalises a stored key / combo string (raw DOM e.key from older saves,
+// or an accelerator already built by acceleratorFromEvent) into a valid
+// Electron accelerator. Returns null when it can't be one (e.g. 'é', a bare
+// modifier) so callers can report it instead of registering garbage.
+const _ACCEL_NAME_MAP = {
+  ' ': 'Space', space: 'Space', escape: 'Esc', esc: 'Esc', enter: 'Enter',
+  return: 'Enter', tab: 'Tab', backspace: 'Backspace', delete: 'Delete',
+  del: 'Delete', insert: 'Insert', home: 'Home', end: 'End',
+  pageup: 'PageUp', pagedown: 'PageDown', pause: 'Pause',
+  capslock: 'Capslock', numlock: 'Numlock', scrolllock: 'Scrolllock',
+  printscreen: 'PrintScreen', arrowup: 'Up', arrowdown: 'Down',
+  arrowleft: 'Left', arrowright: 'Right', up: 'Up', down: 'Down',
+  left: 'Left', right: 'Right', '+': 'Plus', plus: 'Plus',
+  numadd: 'numadd', numsub: 'numsub', nummult: 'nummult', numdiv: 'numdiv', numdec: 'numdec',
+};
+const _ACCEL_MODIFIERS = {
+  ctrl: 'Ctrl', control: 'Ctrl', commandorcontrol: 'CommandOrControl', cmdorctrl: 'CmdOrCtrl',
+  alt: 'Alt', option: 'Alt', altgr: 'AltGr', shift: 'Shift', super: 'Super', meta: 'Super',
+};
 function keyToAccelerator(key) {
-  const map = { 'F1':'F1','F2':'F2','F3':'F3','F4':'F4','F5':'F5','F6':'F6',
-    'F7':'F7','F8':'F8','F9':'F9','F10':'F10','F11':'F11','F12':'F12',
-    'Escape':'Escape','Delete':'Delete','Insert':'Insert',
-    'Home':'Home','End':'End','PageUp':'PageUp','PageDown':'PageDown',
-    'Pause':'Pause','NumLock':'NumLock','ScrollLock':'ScrollLock' };
-  if (map[key]) return map[key];
-  if (key.length === 1) return key.toUpperCase();
-  return key;
+  if (key == null) return null;
+  let s = String(key).trim();
+  if (!s) return String(key) === ' ' ? 'Space' : null;
+  // Split a combo on '+', keeping a literal '+' key ("Ctrl++" / "+")
+  let parts = s === '+' ? ['+'] : s.replace(/\+\+$/, '+Plus').split('+');
+  parts = parts.map(p => p.trim()).filter(Boolean);
+  if (!parts.length) return null;
+  const out = [];
+  for (let i = 0; i < parts.length; i++) {
+    const p = parts[i], lower = p.toLowerCase(), last = i === parts.length - 1;
+    if (!last) {
+      if (!_ACCEL_MODIFIERS[lower]) return null;
+      out.push(_ACCEL_MODIFIERS[lower]);
+      continue;
+    }
+    if (_ACCEL_MODIFIERS[lower]) return null;                 // bare modifier
+    let m;
+    if ((m = lower.match(/^f([0-9]{1,2})$/)) && +m[1] >= 1 && +m[1] <= 24) out.push('F' + m[1]);
+    else if ((m = lower.match(/^num([0-9])$/))) out.push('num' + m[1]);
+    else if (_ACCEL_NAME_MAP[lower]) out.push(_ACCEL_NAME_MAP[lower]);
+    else if (/^[a-z]$/i.test(p))      out.push(p.toUpperCase());
+    else if (/^[\x21-\x7e]$/.test(p)) out.push(p);             // ASCII digit / punctuation
+    else return null;                                          // 'é', 'ù', '²'… unsupported
+  }
+  return out.join('+');
 }
 window.keyToAccelerator = keyToAccelerator;
 
@@ -557,13 +710,26 @@ async function saveWebhookSettings() {
   try {
     const s = (await window.api.readSettings()) || {};
     s.webhookUrl = url;
-    const evIds = ['macro_start', 'macro_stop', 'macro_auto_stop', 'rule_triggered'];
+    const evIds = ['macro_start', 'macro_stop', 'macro_auto_stop', 'rule_triggered',
+                   'game_closed', 'macro_errors', 'autobouffe_fail', 'session_summary'];
     s.webhookEvents = evIds.filter(ev => document.getElementById(`wh-ev-${ev}`)?.checked);
     if (document.getElementById('wh-ev-autoclicker')?.checked) s.webhookEvents.push('autoclicker_start', 'autoclicker_stop');
     if (document.getElementById('wh-ev-autobouffe')?.checked)  s.webhookEvents.push('autobouffe_start', 'autobouffe_stop');
-    s.webhookDebugReport = document.getElementById('wh-ev-debug-report')?.checked !== false;
+
+    const mention = (document.getElementById('set-wh-mention')?.value || '').trim();
+    if (mention && !/^\d+$/.test(mention)) {
+      appendLog('WARNING', 'ID Discord invalide (chiffres uniquement) — mention ignorée');
+      s.webhookMention = '';
+    } else {
+      s.webhookMention = mention;
+    }
+    const thr = parseInt(document.getElementById('set-wh-threshold')?.value, 10);
+    s.webhookErrorThreshold = Number.isFinite(thr) && thr >= 1 ? thr : 5;
+    s.webhookAlertScreenshot = document.getElementById('set-wh-alert-shot')?.checked !== false;
+    s.webhookSessionOnExit   = document.getElementById('set-wh-session-exit')?.checked !== false;
+    delete s.webhookDebugReport;
     await window.api.writeSettings(s);
-    if (url) await window.api.setWebhook({ url, events: s.webhookEvents, debug_screenshot: s.webhookDebugReport });
+    await window.api.setWebhook(buildWebhookConfig(s));
     statusEl.textContent = '✅ Sauvegardé';
     statusEl.style.color = 'var(--success)';
   } catch (e) {
@@ -580,7 +746,10 @@ async function testWebhook() {
     // testing right after typing a new URL (without clicking "Sauvegarder"
     // first) silently tests against the engine's stale/previous _webhook_url.
     const url = document.getElementById('set-webhook-url')?.value?.trim();
-    if (url) await window.api.setWebhook({ url }).catch(() => {});
+    if (url) {
+      const st = (await window.api.readSettings().catch(() => null)) || {};
+      await window.api.setWebhook({ ...buildWebhookConfig(st), url: url === DEV_DEBUG_WEBHOOK_URL ? '' : url }).catch(() => {});
+    }
     await window.api.sendWebhook({ event: 'test', data: { message: 'Test de webhook depuis MacroEngine' } });
     statusEl.textContent = '✅ Webhook envoyé';
     statusEl.style.color = 'var(--success)';
@@ -594,19 +763,34 @@ async function saveShortcutSettings() {
   const stopKey       = document.getElementById('set-shortcut-stop').value.trim();
   const pauseKey      = document.getElementById('set-shortcut-pause').value.trim();
   const recStopKey    = document.getElementById('set-shortcut-record-stop').value.trim();
+  const overlayKey    = (document.getElementById('set-shortcut-overlay')?.value || '').trim();
   const statusEl      = document.getElementById('shortcut-status');
   try {
     const s = (await window.api.readSettings()) || {};
     s.shortcutStop       = stopKey;
     s.shortcutPause      = pauseKey;
     s.shortcutRecordStop = recStopKey;
+    s.shortcutOverlay    = overlayKey || 'F8';
     await window.api.writeSettings(s);
-    if (stopKey)    _globalShortcutMap.stop        = keyToAccelerator(stopKey);
-    else            delete _globalShortcutMap.stop;
-    if (pauseKey)   _globalShortcutMap.pause       = keyToAccelerator(pauseKey);
-    else            delete _globalShortcutMap.pause;
-    _globalShortcutMap.record_stop = recStopKey ? keyToAccelerator(recStopKey) : 'F9';
-    await _applyGlobalShortcuts();
+    const invalid = [];
+    const setAcc = (action, raw, fallback) => {
+      const acc = raw ? keyToAccelerator(raw) : fallback;
+      if (raw && !acc) invalid.push(raw);
+      if (acc) _globalShortcutMap[action] = acc;
+      else     delete _globalShortcutMap[action];
+    };
+    setAcc('stop', stopKey, null);
+    setAcc('pause', pauseKey, null);
+    setAcc('record_stop', recStopKey, 'F9');
+    setAcc('overlay', overlayKey, 'F8');
+    const failed = await _applyGlobalShortcuts();
+    const bad = invalid.concat(failed.filter(a => ['stop', 'pause', 'record_stop', 'overlay'].includes(a))
+      .map(a => _globalShortcutMap[a]));
+    if (bad.length) {
+      statusEl.textContent = `❌ Raccourci(s) refusé(s) : ${bad.join(', ')} (touche invalide ou déjà utilisée)`;
+      statusEl.style.color = 'var(--accent)';
+      return;
+    }
     statusEl.textContent = '✅ Raccourcis activés';
     statusEl.style.color = 'var(--success)';
   } catch (e) {

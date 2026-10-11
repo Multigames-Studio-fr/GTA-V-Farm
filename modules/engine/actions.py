@@ -53,6 +53,7 @@ from __future__ import annotations
 import os
 import time
 import random
+import threading
 import subprocess
 import ctypes
 import ctypes.wintypes
@@ -81,6 +82,64 @@ def _interruptible_sleep(duration: float, stop_event=None, step: float = 0.05) -
         time.sleep(duration)
         return False
     return stop_event.wait(timeout=duration)
+
+
+# ── Suivi des touches / boutons souris actuellement enfoncés ──────────────────
+# (kind, name, direct) → ident du thread qui l'a enfoncé.
+#   kind   'key' | 'mouse'
+#   direct True = pydirectinput, False = pyautogui (mouse : toujours pyautogui)
+# Permet de tout relâcher sur arrêt d'urgence (F12, stop_all, EOF) ou en fin de
+# runner, au lieu de laisser une touche « collée » côté jeu.
+_held: dict[tuple, int] = {}
+_held_lock = threading.Lock()
+
+
+def _mark_held(kind: str, name: str, direct: bool = False) -> None:
+    with _held_lock:
+        _held[(kind, name, bool(direct))] = threading.get_ident()
+
+
+def _mark_released(kind: str, name: str, direct: bool | None = None) -> None:
+    with _held_lock:
+        if direct is None:
+            _held.pop((kind, name, True), None)
+            _held.pop((kind, name, False), None)
+        else:
+            _held.pop((kind, name, bool(direct)), None)
+
+
+def _press_key(key: str, direct: bool) -> None:
+    (pydirectinput.keyDown if direct else pyautogui.keyDown)(key)
+    _mark_held('key', key, direct)
+
+
+def _release_key(key: str, direct: bool) -> None:
+    try:
+        (pydirectinput.keyUp if direct else pyautogui.keyUp)(key)
+    finally:
+        _mark_released('key', key, direct)
+
+
+def release_all_held_keys(owner: int | None = None) -> None:
+    """
+    Relâche toutes les touches / boutons souris enfoncés par le moteur.
+    owner : ident de thread — ne relâche que ce que ce thread a enfoncé
+            (None = tout relâcher). Les erreurs par touche sont ignorées.
+    """
+    with _held_lock:
+        items = [k for k, o in _held.items() if owner is None or o == owner]
+        for k in items:
+            _held.pop(k, None)
+    for kind, name, direct in items:
+        try:
+            if kind == 'mouse':
+                pyautogui.mouseUp(button=name)
+            elif direct:
+                pydirectinput.keyUp(name)
+            else:
+                pyautogui.keyUp(name)
+        except Exception:
+            pass
 
 
 def _set_cursor(x: int, y: int) -> None:
@@ -184,7 +243,7 @@ def exec_action(action: dict, ctx: dict | None = None) -> None:
     elif t == 'key_hold':            _key_hold(action, ctx)
     elif t == 'key_release':         _key_release(action)
     elif t == 'key_combo':           _key_combo(action)
-    elif t == 'type_text':           _type_text(action)
+    elif t == 'type_text':           _type_text(action, ctx)
 
     # ── Souris ─────────────────────────────────────────────────────────────
     elif t == 'mouse_move':          _mouse_move(action, ctx)
@@ -252,10 +311,11 @@ def _key_tap(a: dict, ctx: dict | None = None) -> None:
     for i in range(count):
         if stop and stop.is_set():
             break
-        if direct:
-            pydirectinput.keyDown(key); time.sleep(dur); pydirectinput.keyUp(key)
-        else:
-            pyautogui.keyDown(key);    time.sleep(dur); pyautogui.keyUp(key)
+        _press_key(key, direct)
+        try:
+            time.sleep(dur)
+        finally:
+            _release_key(key, direct)   # keyUp garanti, même sur exception
         if i < count - 1:
             if _interruptible_sleep(delay, stop):
                 break
@@ -270,14 +330,11 @@ def _key_hold(a: dict, ctx: dict | None = None) -> None:
     dur    = float(a.get('duration', 1.0))
     direct = a.get('use_direct', True)
     stop   = (ctx or {}).get('_stop')
-    if direct:
-        pydirectinput.keyDown(key)
+    _press_key(key, direct)
+    try:
         _interruptible_sleep(dur, stop)
-        pydirectinput.keyUp(key)
-    else:
-        pyautogui.keyDown(key)
-        _interruptible_sleep(dur, stop)
-        pyautogui.keyUp(key)
+    finally:
+        _release_key(key, direct)
 
 
 def _key_release(a: dict) -> None:
@@ -286,10 +343,7 @@ def _key_release(a: dict) -> None:
     Paramètres : key, use_direct
     """
     key = a.get('key', '')
-    if a.get('use_direct', True):
-        pydirectinput.keyUp(key)
-    else:
-        pyautogui.keyUp(key)
+    _release_key(key, a.get('use_direct', True))
 
 
 def _key_combo(a: dict) -> None:
@@ -303,17 +357,25 @@ def _key_combo(a: dict) -> None:
     Exemple : {"type":"key_combo","keys":["ctrl","shift","esc"]}
     """
     keys   = a.get('keys', [])
+    if isinstance(keys, str):   # anciennes macros : "ctrl+c" au lieu de ["ctrl","c"]
+        keys = [k.strip() for k in keys.split('+') if k.strip()]
     dur    = float(a.get('duration', 0.05))
     direct = a.get('use_direct', False)   # pyautogui gère mieux les combos
     if not keys:
         return
-    down = pydirectinput.keyDown if direct else pyautogui.keyDown
-    up   = pydirectinput.keyUp   if direct else pyautogui.keyUp
-    for k in keys:
-        down(k)
-    time.sleep(dur)
-    for k in reversed(keys):
-        up(k)
+    pressed: list[str] = []
+    try:
+        for k in keys:
+            _press_key(k, direct)
+            pressed.append(k)
+        time.sleep(dur)
+    finally:
+        # Relâche dans l'ordre inverse, même si un keyDown/sleep a levé
+        for k in reversed(pressed):
+            try:
+                _release_key(k, direct)
+            except Exception:
+                pass
 
 
 _KEYBDINPUT_FIELDS = [
@@ -337,31 +399,57 @@ _KEYEVENTF_UNICODE = 0x0004
 _KEYEVENTF_KEYUP   = 0x0002
 
 
-def _send_unicode_char(char: str) -> None:
-    """SendInput with KEYEVENTF_UNICODE — layout-independent character injection."""
-    code = ord(char)
+_VK_RETURN = 0x0D
+
+
+def _send_kb_event(vk: int, scan: int, flags: int) -> None:
     inp = _INPUT_KB()
     inp.type       = 1  # INPUT_KEYBOARD
-    inp.ki.wVk     = 0
-    inp.ki.wScan   = code
-    inp.ki.dwFlags = _KEYEVENTF_UNICODE
-    _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
-    inp.ki.dwFlags = _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP
+    inp.ki.wVk     = vk
+    inp.ki.wScan   = scan
+    inp.ki.dwFlags = flags
     _user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
 
 
-def _type_text(a: dict) -> None:
+def _send_unicode_char(char: str) -> None:
+    """SendInput with KEYEVENTF_UNICODE — layout-independent character injection.
+    Les caractères hors BMP (> U+FFFF, ex. emojis) sont envoyés en paire de
+    substitution UTF-16 (wScan est sur 16 bits)."""
+    data  = char.encode('utf-16-le')
+    units = [int.from_bytes(data[i:i + 2], 'little') for i in range(0, len(data), 2)]
+    for u in units:
+        _send_kb_event(0, u, _KEYEVENTF_UNICODE)
+    for u in units:
+        _send_kb_event(0, u, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP)
+
+
+def _send_enter() -> None:
+    """Entrée via VK_RETURN (un '\\n' en unicode 0x0A n'est pas interprété comme Entrée)."""
+    _send_kb_event(_VK_RETURN, 0, 0)
+    _send_kb_event(_VK_RETURN, 0, _KEYEVENTF_KEYUP)
+
+
+def _type_text(a: dict, ctx: dict | None = None) -> None:
     """
     Tape du texte caractère par caractère via SendInput KEYEVENTF_UNICODE.
     Layout-indépendant : fonctionne sur AZERTY, QWERTY, etc.
+    '\\n', '\\r' et '\\r\\n' → une seule pression sur Entrée. Interruptible.
     Paramètres : text, interval (défaut 0.05s entre chaque caractère)
     """
     text     = a.get('text', '')
     interval = float(a.get('interval', 0.05))
+    stop     = (ctx or {}).get('_stop')
+    text     = text.replace('\r\n', '\n').replace('\r', '\n')
     for ch in text:
-        _send_unicode_char(ch)
+        if stop and stop.is_set():
+            break
+        if ch == '\n':
+            _send_enter()
+        else:
+            _send_unicode_char(ch)
         if interval > 0:
-            time.sleep(interval)
+            if _interruptible_sleep(interval, stop):
+                break
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -468,11 +556,17 @@ def _mouse_drag(a: dict, ctx: dict | None = None) -> None:
     _set_cursor(x1, y1)
     if _interruptible_sleep(0.05, stop): return
     pyautogui.mouseDown(button=button)
-    if _interruptible_sleep(0.05, stop):
-        pyautogui.mouseUp(button=button)
-        return
-    _smooth_move(x2, y2, duration, use_bezier=use_bez, stop_event=stop)
-    pyautogui.mouseUp(button=button)
+    _mark_held('mouse', button)
+    try:
+        if _interruptible_sleep(0.05, stop):
+            return
+        _smooth_move(x2, y2, duration, use_bezier=use_bez, stop_event=stop)
+    finally:
+        # mouseUp garanti, même si le mouvement lève une exception
+        try:
+            pyautogui.mouseUp(button=button)
+        finally:
+            _mark_released('mouse', button)
 
 
 def _scroll(a: dict) -> None:

@@ -206,9 +206,7 @@ async function _startAutoClickerInner() {
   try {
     await ensureEngine();
     const settings = await window.api.readSettings().catch(() => ({}));
-    if (settings?.webhookUrl) {
-      await window.api.setWebhook({ url: settings.webhookUrl }).catch(() => {});
-    }
+    await window.api.setWebhook(buildWebhookConfig(settings)).catch(() => {});
     await window.api.macroStart({ macro, macro_id: '__auto_clicker__' });
     _acpSetRunning(true);
     // Captured locally (not read back from the shared _acpStatusPoller
@@ -281,41 +279,60 @@ function _acpCapKey(el, fieldId) {
   el.style.color = 'var(--accent)';
 }
 
-function _acpRegisterHotkeys() {
+// Resolves to the list of failed actions ('acp_start' / 'acp_stop').
+async function _acpRegisterHotkeys() {
   // Capture listener stays on document (only needed when window is focused, during key capture)
   document.removeEventListener('keydown', _acpCaptureHandler, true);
   document.addEventListener('keydown', _acpCaptureHandler, true);
   // Actual start/stop hotkeys → Electron globalShortcut (works when app not focused)
   const startKey = _acpHotkeys['acp-key-start'] || '';
   const stopKey  = _acpHotkeys['acp-key-stop']  || '';
-  if (window._setGlobalShortcuts) {
-    const toAcc = window.keyToAccelerator || (k => k);
-    window._setGlobalShortcuts({
-      acp_start: startKey ? toAcc(startKey) : null,
-      acp_stop:  stopKey  ? toAcc(stopKey)  : null,
-    });
-  }
+  if (!window._setGlobalShortcuts) return [];
+  const toAcc = window.keyToAccelerator || (k => k);
+  const startAcc = startKey ? toAcc(startKey) : null;
+  const stopAcc  = stopKey  ? toAcc(stopKey)  : null;
+  const failed = (await window._setGlobalShortcuts({ acp_start: startAcc, acp_stop: stopAcc })) || [];
+  // A stored key that can't even be expressed as an accelerator never reaches main.js
+  if (startKey && !startAcc) failed.push('acp_start');
+  if (stopKey  && !stopAcc)  failed.push('acp_stop');
+  return failed.filter(a => a === 'acp_start' || a === 'acp_stop');
 }
 
-function _acpCaptureHandler(e) {
+const _ACP_FIELD_ACTION = { 'acp-key-start': 'acp_start', 'acp-key-stop': 'acp_stop' };
+
+function _acpRejectHotkey(fieldId, el, prev, reason) {
+  _acpHotkeys[fieldId] = prev;
+  if (el) { el.value = prev; el.style.color = ''; }
+  _acpSave();
+  if (typeof showToast === 'function') showToast(reason, 'error', 6000);
+  else appendLog('WARNING', reason);
+}
+
+async function _acpCaptureHandler(e) {
   if (!_acpCapturing) return;
-  // A bare modifier press (Control/Shift/Alt/Meta) isn't a valid Electron
-  // accelerator on its own — globalShortcut.register() throws. Ignore it
-  // and keep listening for the actual key.
-  if (['Control', 'Shift', 'Alt', 'Meta'].includes(e.key)) {
-    e.preventDefault();
-    e.stopPropagation();
-    return;
-  }
-  const key = e.key === ' ' ? 'Space' : e.key;
   e.preventDefault();
   e.stopPropagation();
-  _acpCapturing.el.value       = key;
-  _acpCapturing.el.style.color = '';
-  _acpHotkeys[_acpCapturing.fieldId] = key;
+  // Bare modifier (Ctrl/Shift/Alt/Meta) isn't a valid accelerator on its own
+  // → keep listening for the actual key (modifiers get folded into it).
+  const acc = acceleratorFromEvent(e);
+  if (acc === null) return;
+  const { el, fieldId } = _acpCapturing;
   _acpCapturing = null;
+  const prev = _acpHotkeys[fieldId] || (fieldId === 'acp-key-start' ? 'F6' : 'F7');
+  if (typeof acc === 'object') {
+    _acpRejectHotkey(fieldId, el, prev, `${acc.error} — raccourci inchangé (${prev}).`);
+    return;
+  }
+  el.value       = acc;
+  el.style.color = '';
+  _acpHotkeys[fieldId] = acc;
   _acpSave();
-  _acpRegisterHotkeys();
+  const failed = await _acpRegisterHotkeys();
+  if (failed.includes(_ACP_FIELD_ACTION[fieldId])) {
+    _acpRejectHotkey(fieldId, el, prev,
+      `Raccourci « ${acc} » refusé (déjà utilisé par une autre application ou invalide) — retour à ${prev}.`);
+    _acpRegisterHotkeys();
+  }
 }
 
 /* ── Licence settings helpers ────────────────────────────── */

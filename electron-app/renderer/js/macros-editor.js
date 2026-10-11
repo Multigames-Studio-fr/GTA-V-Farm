@@ -299,7 +299,7 @@ function _actionNodeSummary(a) {
   const t = a.type || 'key_tap';
   const s = v => String(v ?? '');
   if (['key_tap', 'key_hold', 'key_release'].includes(t)) return s(a.key);
-  if (t === 'key_combo')        return s(a.keys);
+  if (t === 'key_combo')        return Array.isArray(a.keys) ? a.keys.join('+') : s(a.keys);
   if (t === 'type_text')        return `"${s(a.text).slice(0, 22)}"`;
   if (t === 'wait')             return `${a.duration ?? 0}s`;
   if (t === 'random_wait')      return `${a.min_s ?? 0}–${a.max_s ?? 0}s`;
@@ -1179,7 +1179,8 @@ function startKeyCaptureCond(input, field) {
   input.classList.add('capturing');
   const handler = (e) => {
     e.preventDefault(); e.stopPropagation();
-    input.value = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // key_pressed conditions use GetAsyncKeyState(VK) → VK-style name
+    input.value = keyVkNameFromEvent(e);
     input.classList.remove('capturing');
     input.removeEventListener('keydown', handler);
     input.removeEventListener('blur', blurHandler);
@@ -1375,7 +1376,7 @@ function renderActionInlineFields(a) {
   }
   if (t === 'key_combo') {
     return `<div class="fields-row">
-      <span>Combo</span><input type="text" class="af keys" style="width:160px" value="${escHtml(a.keys || 'ctrl+c')}" placeholder="ctrl+shift+s" onchange="syncActField(this,'keys')">
+      <span>Combo</span><input type="text" class="af keys" style="width:160px" value="${escHtml(Array.isArray(a.keys) ? a.keys.join('+') : (a.keys || 'ctrl+c'))}" placeholder="ctrl+shift+s" onchange="syncActComboKeys(this)">
       <span>Durée(s)</span><input type="number" class="af dur" value="${a.duration || 0.05}" min="0.01" step="0.01" onchange="syncActField(this,'duration',true)">
     </div>`;
   }
@@ -1567,6 +1568,28 @@ function syncActField(inputEl, field, isNum, inputType) {
   a[field] = (typeof val === 'number' && isNaN(val)) ? undefined : val;
 }
 
+// key_combo: actions._key_combo iterates `keys` as a list — a raw "ctrl+c"
+// string would be pressed char by char ('c','t','r','l','+','c').
+function syncActComboKeys(inputEl) {
+  syncActField(inputEl, 'keys');
+  const row = inputEl.closest('.item-row');
+  if (!row) return;
+  let a;
+  const section = row.dataset.section;
+  if (section) a = macros[currentMacroIdx]?.[section]?.[parseInt(row.dataset.idx)];
+  else {
+    const [, ri, ai] = row.id.split('-').map(Number);
+    a = macros[currentMacroIdx]?.rules[ri]?.actions[ai];
+  }
+  if (!a) return;
+  const raw = String(inputEl.value || '');
+  // '+' is the separator; a trailing '++' (or 'plus') means the + key itself
+  const keys = raw.replace(/\+\+$/, '+plus').split('+')
+    .map(k => k.trim().toLowerCase()).filter(Boolean)
+    .map(k => (k === 'plus' ? '+' : k));
+  a.keys = keys;
+}
+
 // Special sync for webhook message (nested in data.message)
 function syncActWebhookMsg(inputEl) {
   const row = inputEl.closest('.item-row');
@@ -1694,7 +1717,8 @@ function startKeyCapture(input) {
   const handler = (e) => {
     e.preventDefault();
     e.stopPropagation();
-    input.value = e.key.length === 1 ? e.key.toLowerCase() : e.key;
+    // key_tap/key_hold/key_release are sent via pydirectinput → physical name
+    input.value = keyNameFromEvent(e);
     input.classList.remove('capturing');
     input.removeEventListener('keydown', handler);
     input.removeEventListener('blur', blurHandler);
@@ -1797,12 +1821,15 @@ function captureKillSwitchKey(inputEl) {
   _ksKeyListener = function onKey(e) {
     e.preventDefault();
     e.stopPropagation();
+    // Consumed by keyboard.add_hotkey (Python `keyboard` lib, layout-aware
+    // names). Bare modifier / dead key → keep waiting for the real key.
+    const k = keyboardLibNameFromEvent(e);
+    if (!k) return;
     const parts = [];
     if (e.ctrlKey)  parts.push('ctrl');
     if (e.altKey)   parts.push('alt');
     if (e.shiftKey) parts.push('shift');
-    const k = e.key.toLowerCase();
-    if (!['control','alt','shift','meta'].includes(k)) parts.push(k);
+    parts.push(k);
     const combo = parts.join('+');
     if (inputEl) { inputEl.value = combo; inputEl.style.borderColor = ''; }
     if (hint) hint.style.display = 'none';

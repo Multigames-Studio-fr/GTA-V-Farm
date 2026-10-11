@@ -23,10 +23,13 @@ let BASE_URL     = '';
 // swallowing the request) can no longer hang checkForUpdates() forever
 // with no 'updater:done'/'updater:error' ever firing.
 const _GET_INACTIVITY_TIMEOUT_MS = 20000;
+const _MAX_REDIRECTS = 5;
 
 // ── Helpers réseau ────────────────────────────────────────────────────────────
-function _get(url, asBuffer = false) {
+function _get(url, asBuffer = false, redirects = 0) {
   return new Promise((resolve, reject) => {
+    // https only — the downloaded files are executed (Python) / loaded (renderer).
+    if (!url.startsWith('https:')) return reject(new Error(`URL non-https refusée — ${url}`));
     const mod = url.startsWith('https') ? https : http;
     const controller = new AbortController();
     let timer;
@@ -41,9 +44,13 @@ function _get(url, asBuffer = false) {
       signal: controller.signal,
     }, (res) => {
       resetTimer();
-      if (res.statusCode === 301 || res.statusCode === 302) {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
         clearTimeout(timer);
-        return _get(res.headers.location, asBuffer).then(resolve).catch(reject);
+        res.resume();
+        if (redirects >= _MAX_REDIRECTS) return reject(new Error(`Trop de redirections — ${url}`));
+        if (!res.headers.location) return reject(new Error(`Redirection sans Location — ${url}`));
+        const next = new URL(res.headers.location, url).href;
+        return _get(next, asBuffer, redirects + 1).then(resolve).catch(reject);
       }
       if (res.statusCode !== 200) {
         clearTimeout(timer);
@@ -66,8 +73,20 @@ function fetchManifest() {
   return _get(MANIFEST_URL).then(body => JSON.parse(body));
 }
 
-function downloadFile(relPath, destPath) {
+function downloadFile(relPath, destPath, expectedHash) {
   return _get(BASE_URL + relPath, true).then(buf => {
+    // Verify before touching disk — a truncated/tampered download must never
+    // replace the working local file. The manifest is generated on a Windows
+    // runner (CRLF checkout) while raw.githubusercontent serves the LF blob,
+    // so a text file is also accepted in its CRLF form — and written that way,
+    // so the next run's local hash matches instead of re-downloading forever.
+    const sha = b => crypto.createHash('sha256').update(b).digest('hex');
+    const got = sha(buf);
+    if (got !== expectedHash) {
+      const crlf = Buffer.from(buf.toString('latin1').replace(/\r?\n/g, '\r\n'), 'latin1');
+      if (sha(crlf) !== expectedHash) throw new Error(`hash SHA256 invalide (attendu ${expectedHash}, reçu ${got})`);
+      buf = crlf;
+    }
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
     const tmp = destPath + '.tmp';
     fs.writeFileSync(tmp, buf);
@@ -103,6 +122,16 @@ function fileHash(filePath) {
  */
 const RENDERER_MANIFEST_PREFIX = 'electron-app/renderer/';
 
+// Map a manifest key to its local path, or null if it would escape its base
+// dir (the manifest is remote data — "../" or an absolute key must not let it
+// write anywhere on disk).
+function _localPathFor(relPath, botDir, rendererDir) {
+  const isRenderer = relPath.startsWith(RENDERER_MANIFEST_PREFIX);
+  const base = path.resolve(isRenderer ? rendererDir : botDir);
+  const dest = path.resolve(base, isRenderer ? relPath.slice(RENDERER_MANIFEST_PREFIX.length) : relPath);
+  return dest.startsWith(base + path.sep) ? dest : null;
+}
+
 async function checkForUpdates(botDir, rendererDir, github, onProgress) {
   const base = `https://raw.githubusercontent.com/${github.user}/${github.repo}/${github.branch}`;
   MANIFEST_URL = `${base}/update-manifest.json`;
@@ -114,33 +143,33 @@ async function checkForUpdates(botDir, rendererDir, github, onProgress) {
   const SKIP_FILES = new Set(['main.py', 'modules/engine/screen_reader.py']);
 
   // Comparer les hashes
+  // (package.json used to be force-updated on every run "pour version UI",
+  // which made upToDate never true — the UI version comes from
+  // app.getVersion() anyway, so it now follows the same hash rule.)
   const toUpdate = [];
+  const errors   = [];
   for (const [relPath, expectedHash] of Object.entries(files)) {
     if (SKIP_FILES.has(relPath)) continue;
-    // Toujours updater package.json (pour version UI)
-    const isPkg = relPath === 'electron-app/package.json';
-    const localPath = relPath.startsWith(RENDERER_MANIFEST_PREFIX)
-      ? path.join(rendererDir, relPath.slice(RENDERER_MANIFEST_PREFIX.length))
-      : path.join(botDir, relPath);
-    if (fileHash(localPath) !== expectedHash || isPkg) {
-      toUpdate.push(relPath);
+    const localPath = _localPathFor(relPath, botDir, rendererDir);
+    if (!localPath) {
+      errors.push({ file: relPath, error: 'chemin hors du dossier cible — ignoré' });
+      continue;
+    }
+    if (fileHash(localPath) !== expectedHash) {
+      toUpdate.push({ relPath, localPath, expectedHash });
     }
   }
 
-  if (toUpdate.length === 0) {
+  if (toUpdate.length === 0 && errors.length === 0) {
     return { upToDate: true, version, updated: [], errors: [] };
   }
 
   // Télécharger les fichiers modifiés
   const updated = [];
-  const errors  = [];
 
-  for (const relPath of toUpdate) {
+  for (const { relPath, localPath: destPath, expectedHash } of toUpdate) {
     try {
-      const destPath = relPath.startsWith(RENDERER_MANIFEST_PREFIX)
-        ? path.join(rendererDir, relPath.slice(RENDERER_MANIFEST_PREFIX.length))
-        : path.join(botDir, relPath);
-      await downloadFile(relPath, destPath);
+      await downloadFile(relPath, destPath, expectedHash);
       updated.push(relPath);
       if (onProgress) onProgress(relPath);
     } catch (e) {

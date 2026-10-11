@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, globalShortcut, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, globalShortcut, dialog, screen } = require('electron');
 const path    = require('path');
 const fs      = require('fs');
 const https   = require('https');
@@ -62,6 +62,14 @@ const BOT_DIR        = IS_PACKED
 const RENDERER_DIR   = IS_PACKED
   ? path.join(process.resourcesPath, 'app.asar.unpacked', 'renderer')
   : path.join(__dirname, 'renderer');
+
+// Secondary windows (picker/overlay) load from RENDERER_DIR like the main
+// window, so auto-updated copies are used — falling back to the copy bundled
+// in the asar if the unpacked file is somehow missing.
+function _rendererFile(name) {
+  const p = path.join(RENDERER_DIR, name);
+  return fs.existsSync(p) ? p : path.join(__dirname, 'renderer', name);
+}
 
 const ROOT_DIR      = BOT_DIR;
 const MAIN_PY       = path.join(BOT_DIR, 'main.py');
@@ -225,6 +233,7 @@ let overlayWindow = null;
 let engineProc    = null;          // Python macro engine process
 const _pending    = new Map();     // request id → { resolve, reject }
 let _msgBuf       = '';            // line buffer for engine stdout
+let _licenseRevoked = false;       // set by _onLicenseRevoked — engine refuses to (re)start
 
 function _sendToOverlay(channel, data) {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
@@ -483,8 +492,27 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   _stopLicenseWatcher();
-  killEngine();
+  // Non-darwin : app.quit() déclenche before-quit (résumé de session envoyé
+  // au moteur) puis will-quit, qui tue le moteur. On ne le tue donc pas ici.
   if (process.platform !== 'darwin') app.quit();
+  else killEngine();
+});
+
+// Résumé de session Discord à la fermeture : une seule fois, 7 s max.
+// (app:restart passe par app.exit() et ne déclenche pas ce hook.)
+let _sessionShutdownDone = false;
+app.on('before-quit', (event) => {
+  if (_sessionShutdownDone || !engineProc) return;
+  _sessionShutdownDone = true;
+  event.preventDefault();
+  Promise.race([
+    engineCmd({ cmd: 'session_shutdown' }, 7000),
+    new Promise((resolve) => setTimeout(resolve, 7000)),
+  ]).catch((e) => {
+    writeLog('WARN', 'session_shutdown:', e && e.message);
+  }).finally(() => {
+    app.quit();
+  });
 });
 
 app.on('activate', () => {
@@ -494,13 +522,22 @@ app.on('activate', () => {
 // ── Macro Engine : démarrage / arrêt ─────────────────────────────────────────
 function startEngine() {
   if (engineProc) return;
+  if (_licenseRevoked) { writeLog('WARN', 'startEngine() refusé — licence révoquée'); return; }
 
   writeLog('INFO', 'startEngine() →', PYTHON_EXE, MAIN_PY);
-  engineProc = spawn(PYTHON_EXE, ['-u', MAIN_PY], {
+  // Local handle: every handler below checks `engineProc !== proc` so a
+  // killed process's late 'close'/'data' can't clobber a newer engine
+  // (stop → start before the old one has actually exited).
+  const proc = spawn(PYTHON_EXE, ['-u', MAIN_PY], {
     cwd:         ROOT_DIR,
     windowsHide: true,
     env:         { ...process.env, PYTHONUNBUFFERED: '1', MACROENGINE_AI_DEPS_DIR: AI_DEPS_DIR, MACROENGINE_USERDATA_DIR: USERDATA_DIR },
   });
+  engineProc = proc;
+  // Decode as a stream — chunk.toString() would turn a multibyte UTF-8 char
+  // split across two chunks into U+FFFD.
+  proc.stdout.setEncoding('utf8');
+  proc.stderr.setEncoding('utf8');
 
   // Without these, a broken pipe (e.g. engineCmd writing to stdin the
   // instant the Python process dies) emits an unhandled 'error' on that
@@ -508,13 +545,14 @@ function startEngine() {
   // the top-level uncaughtException dialog for what should be a routine,
   // locally-recoverable IPC failure (engineCmd's own try/catch already
   // handles the write failing).
-  engineProc.stdin.on('error', err => writeLog('WARNING', 'Engine stdin error:', err.message));
-  engineProc.stdout.on('error', err => writeLog('WARNING', 'Engine stdout error:', err.message));
-  engineProc.stderr.on('error', err => writeLog('WARNING', 'Engine stderr error:', err.message));
+  proc.stdin.on('error', err => writeLog('WARNING', 'Engine stdin error:', err.message));
+  proc.stdout.on('error', err => writeLog('WARNING', 'Engine stdout error:', err.message));
+  proc.stderr.on('error', err => writeLog('WARNING', 'Engine stderr error:', err.message));
 
   // Line-by-line stdout reader
-  engineProc.stdout.on('data', chunk => {
-    _msgBuf += chunk.toString();
+  proc.stdout.on('data', chunk => {
+    if (engineProc !== proc) return;
+    _msgBuf += chunk;
     const lines = _msgBuf.split('\n');
     _msgBuf = lines.pop();          // keep incomplete last line
     for (const line of lines) {
@@ -525,15 +563,18 @@ function startEngine() {
     }
   });
 
-  engineProc.stderr.on('data', d => {
-    const txt = d.toString().trim();
+  proc.stderr.on('data', d => {
+    if (engineProc !== proc) return;
+    const txt = d.trim();
     writeLog('PYERR', txt);
     mainWindow?.webContents.send('engine:log', { level: 'ERROR', msg: txt });
     _sendToOverlay('overlay:log', { level: 'PYERR', msg: txt });
   });
 
-  engineProc.on('close', code => {
+  proc.on('close', code => {
     writeLog('INFO', 'Engine fermé, code:', code);
+    // A newer engine already owns the shared buffer/pending map — leave it be.
+    if (engineProc && engineProc !== proc) return;
     engineProc = null;
     _msgBuf    = '';
     for (const [, { reject }] of _pending) reject(new Error('Engine stopped'));
@@ -544,8 +585,9 @@ function startEngine() {
     _sendToOverlay('overlay:acp-status', { running: false });
   });
 
-  engineProc.on('error', err => {
+  proc.on('error', err => {
     writeLog('ERROR', 'Engine spawn error:', err.message);
+    if (engineProc !== proc) return;
     engineProc = null;
     mainWindow?.webContents.send('engine:stopped', { error: err.message });
   });
@@ -561,6 +603,11 @@ function killEngine() {
     }
   } catch (_) {}
   engineProc = null;
+  // The killed proc's 'close' is ignored once a new engine starts, so its
+  // buffer/pending requests are flushed here rather than there.
+  _msgBuf = '';
+  for (const [, { reject }] of _pending) reject(new Error('Engine stopped'));
+  _pending.clear();
 }
 
 // Poll until engineProc.stdin is writable (or timeoutMs elapses) — shared
@@ -608,6 +655,12 @@ function _dispatchFromEngine(msg) {
     mainWindow?.webContents.send('engine:macro_start_request', { name: msg.name });
   } else if (msg.type === 'pick_result') {
     _pickerOnResult?.(msg);
+  } else if (msg.type === 'alert') {
+    // Critical engine alert (game_closed / macro_errors) — the main renderer
+    // relays it to the overlay toast through the overlay feed.
+    mainWindow?.webContents.send('engine:alert', {
+      event: msg.event, title: msg.title || '', message: msg.message || '',
+    });
   }
 }
 
@@ -675,7 +728,7 @@ for (const cmd of [
   // Recording
   'record_start', 'record_stop',
   // Webhook
-  'set_webhook', 'send_webhook',
+  'set_webhook', 'send_webhook', 'set_session_snapshot', 'session_shutdown',
   // State / Stats
   'get_stats', 'get_macro_history', 'get_variables', 'set_variable', 'set_counter', 'clear_state',
   // Dead zones
@@ -684,9 +737,9 @@ for (const cmd of [
   'pixel_snapshot',
 ]) {
   ipcMain.handle(`engine:${cmd}`, async (_evt, params) => {
-    await _ensureEngineStarted();
     try {
-      return await engineCmd({ cmd, ...params });
+      await _ensureEngineStarted();
+      return await engineCmd({ ...params, cmd });
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -699,6 +752,7 @@ for (const cmd of [
 // generic list).
 async function _ensureEngineStarted() {
   if (engineProc) return;
+  if (_licenseRevoked) throw new Error('Licence révoquée — moteur désactivé');
   startEngine();
   await _waitForEngineReady();
 }
@@ -711,9 +765,9 @@ async function _ensureEngineStarted() {
 // conditions used inside running macros, not an actual failure.
 for (const cmd of ['check_ocr', 'ocr_text', 'test_template_score']) {
   ipcMain.handle(`engine:${cmd}`, async (_evt, params) => {
-    await _ensureEngineStarted();
     try {
-      return await engineCmd({ cmd, ...params }, 60000);
+      await _ensureEngineStarted();
+      return await engineCmd({ ...params, cmd }, 60000);
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -728,9 +782,9 @@ for (const cmd of ['check_ocr', 'ocr_text', 'test_template_score']) {
 // symmetry with vlm_ask.
 for (const cmd of ['vlm_ask', 'vlm_warmup', 'vlm_unload']) {
   ipcMain.handle(`engine:${cmd}`, async (_evt, params) => {
-    await _ensureEngineStarted();
     try {
-      return await engineCmd({ cmd, ...params }, 300000);
+      await _ensureEngineStarted();
+      return await engineCmd({ ...params, cmd }, 300000);
     } catch (e) {
       return { ok: false, error: e.message };
     }
@@ -842,7 +896,7 @@ function _startPointPicker(opts) {
       },
     });
     win.setIgnoreMouseEvents(true); // clicks pass through — pynput detects them globally
-    win.loadFile(path.join(__dirname, 'renderer', 'picker.html'));
+    win.loadFile(_rendererFile('picker.html'));
     _pickerWin = win;
 
     win.once('ready-to-show', () => {
@@ -939,7 +993,7 @@ async function _startRegionPicker(opts) {
         },
       });
 
-      win.loadFile(path.join(__dirname, 'renderer', 'picker.html'));
+      win.loadFile(_rendererFile('picker.html'));
       const _win = win;
       const r = cropRects[i];
       const cropRect = { x: r.x - bboxX0, y: r.y - bboxY0, w: r.w, h: r.h };
@@ -969,6 +1023,49 @@ async function _startRegionPicker(opts) {
 }
 
 // ── Overlay window ────────────────────────────────────────────────────────────
+// Transparent, frameless, content-sized: overlay.html measures its own panel
+// and calls overlay:set-size (expanded card 250 px / collapsed pill). 8 px of
+// transparent margin around the card leaves room for its soft shadow.
+// `transparent` can't be toggled after creation on Windows, hence set here;
+// transparent windows aren't edge-resizable on Windows — size is content-driven.
+const OVERLAY_DEFAULT_OPACITY = 55;
+
+function _overlaySettings(s) {
+  s = s || readSettings();
+  const op = parseInt(s.overlayOpacity, 10);
+  const sec = (s.overlaySections && typeof s.overlaySections === 'object') ? s.overlaySections : {};
+  return {
+    enabled:      s.overlayEnabled === true,
+    opacity:      Number.isFinite(op) ? Math.min(100, Math.max(20, op)) : OVERLAY_DEFAULT_OPACITY,
+    locked:       s.overlayLocked === true,
+    clickThrough: s.overlayClickThrough === true,
+    sections: {
+      meal:   sec.meal   !== false,
+      macros: sec.macros !== false,
+      stats:  sec.stats  !== false,
+    },
+    shortcut: s.shortcutOverlay || 'F8',
+  };
+}
+
+function _applyOverlayWindowSettings(os) {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  try { overlayWindow.setMovable(!os.locked); } catch (_) {}
+  try {
+    if (os.clickThrough) overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+    else                 overlayWindow.setIgnoreMouseEvents(false);
+  } catch (_) {}
+}
+
+function _setOverlayEnabled(on) {
+  try {
+    const s = readSettings();
+    if (s.overlayEnabled === on) return;
+    s.overlayEnabled = on;
+    saveSettings(s);
+  } catch (_) {}
+}
+
 function createOverlayWindow() {
   if (overlayWindow && !overlayWindow.isDestroyed()) {
     if (!overlayWindow.isVisible()) overlayWindow.showInactive();
@@ -978,20 +1075,21 @@ function createOverlayWindow() {
   const s   = readSettings();
   const pos = s.overlayBounds || { x: 24, y: 80 };
 
-  const savedSize = s.overlaySize || {};
   overlayWindow = new BrowserWindow({
     x:           pos.x,
     y:           pos.y,
-    width:       280,
-    height:      savedSize.height || 300,
-    minWidth:    240,
-    minHeight:   80,
-    maxWidth:    360,
+    width:       266,
+    height:      320,
     frame:       false,
     transparent: true,
+    backgroundColor: '#00000000',
+    hasShadow:   false,
     alwaysOnTop: true,
     skipTaskbar: true,
-    resizable:   true,
+    resizable:   false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
     focusable:   true,
     show:        false,
     webPreferences: {
@@ -1001,11 +1099,22 @@ function createOverlayWindow() {
     },
   });
 
-  overlayWindow.loadFile(path.join(__dirname, 'renderer', 'overlay.html'));
+  overlayWindow.loadFile(_rendererFile('overlay.html'));
+  overlayWindow.webContents.on('did-fail-load', (_e, code, desc, url) => {
+    writeLog('ERROR', 'overlay did-fail-load:', code, desc, url);
+  });
+  overlayWindow.webContents.on('render-process-gone', (_e, details) => {
+    writeLog('ERROR', 'overlay render-process-gone:', JSON.stringify(details));
+  });
+  overlayWindow.webContents.on('console-message', (_e, level, message, line, sourceId) => {
+    if (level >= 2) writeLog('WARN', `overlay console: ${message} (${sourceId}:${line})`);
+  });
 
   overlayWindow.once('ready-to-show', () => {
+    if (!overlayWindow || overlayWindow.isDestroyed()) return;
     overlayWindow.showInactive();          // show WITHOUT stealing focus
     overlayWindow.setAlwaysOnTop(true, 'screen-saver');
+    _applyOverlayWindowSettings(_overlaySettings());
   });
 
   // Persist position
@@ -1017,16 +1126,7 @@ function createOverlayWindow() {
     saveSettings(s);
   }, 500);
 
-  const _saveOverlaySize = _debounce(() => {
-    if (!overlayWindow || overlayWindow.isDestroyed()) return;
-    const [width, height] = overlayWindow.getSize();
-    const s = readSettings();
-    s.overlaySize = { width, height };
-    saveSettings(s);
-  }, 500);
-
-  overlayWindow.on('move',   _saveOverlayPos);
-  overlayWindow.on('resize', _saveOverlaySize);
+  overlayWindow.on('move', _saveOverlayPos);
 
   overlayWindow.on('closed', () => {
     overlayWindow = null;
@@ -1036,6 +1136,7 @@ function createOverlayWindow() {
 
 ipcMain.handle('overlay:show', () => {
   createOverlayWindow();
+  _setOverlayEnabled(true);
   return { ok: true, visible: true };
 });
 
@@ -1050,6 +1151,7 @@ ipcMain.handle('overlay:toggle', () => {
     return { ok: true, visible: false };
   }
   createOverlayWindow();
+  _setOverlayEnabled(true);
   return { ok: true, visible: true };
 });
 
@@ -1068,9 +1170,86 @@ ipcMain.on('overlay:minimize', () => {
 });
 
 ipcMain.on('overlay:set-size', (_, { w, h } = {}) => {
-  if (overlayWindow && !overlayWindow.isDestroyed() && Number.isFinite(w) && Number.isFinite(h)) {
-    overlayWindow.setSize(Math.round(w), Math.round(h), true);
+  if (!overlayWindow || overlayWindow.isDestroyed() || !Number.isFinite(w) || !Number.isFinite(h)) return;
+  const W = Math.max(40, Math.min(600, Math.round(w)));
+  const H = Math.max(30, Math.min(1000, Math.round(h)));
+  const [cw, ch] = overlayWindow.getSize();
+  if (cw === W && ch === H) return;
+  // A non-resizable window has min = max = its current size on Windows, so
+  // setSize can't shrink it (measured: pill stayed 268×666). Unlock just for
+  // the programmatic resize, then lock again (no user edge-resize). Verified
+  // with an Electron 28 harness: transparency is preserved.
+  try {
+    overlayWindow.setResizable(true);
+    overlayWindow.setSize(W, H, false);
+  } catch (_) {
+  } finally {
+    try { overlayWindow.setResizable(false); } catch (_) {}
   }
+});
+
+// Feed from the main renderer (session / meal / per-macro cycles / alert)
+ipcMain.on('overlay:data', (_, d) => {
+  if (d && typeof d === 'object') _sendToOverlay('overlay:data', d);
+});
+
+// Overlay → main renderer commands (e.g. stop Auto Bouffe, renderer-owned)
+ipcMain.on('overlay:command', (_, d) => {
+  if (d && typeof d.cmd === 'string') mainWindow?.webContents.send('overlay:command', { cmd: d.cmd });
+});
+
+ipcMain.handle('overlay:get-settings', () => _overlaySettings());
+
+ipcMain.on('overlay:set-settings', (_, p = {}) => {
+  try {
+    const s = readSettings();
+    if (typeof p.opacity === 'number' && Number.isFinite(p.opacity)) s.overlayOpacity = Math.min(100, Math.max(20, Math.round(p.opacity)));
+    if (typeof p.locked === 'boolean')       s.overlayLocked = p.locked;
+    if (typeof p.clickThrough === 'boolean') s.overlayClickThrough = p.clickThrough;
+    if (p.sections && typeof p.sections === 'object') {
+      s.overlaySections = {
+        meal:   p.sections.meal   !== false,
+        macros: p.sections.macros !== false,
+        stats:  p.sections.stats  !== false,
+      };
+    }
+    if (typeof p.enabled === 'boolean') s.overlayEnabled = p.enabled;
+    saveSettings(s);
+    const os = _overlaySettings(s);
+    // locked / click-through only when they were part of this update — an
+    // opacity drag must not re-enable ignore-mouse while the bar is hovered.
+    if (typeof p.locked === 'boolean' || typeof p.clickThrough === 'boolean') _applyOverlayWindowSettings(os);
+    if (p.enabled === false && overlayWindow && !overlayWindow.isDestroyed()) {
+      overlayWindow.hide();
+      mainWindow?.webContents.send('overlay:closed');
+    }
+  } catch (e) {
+    writeLog('WARN', 'overlay:set-settings: ' + e.message);
+  }
+});
+
+// Click-through: the overlay temporarily turns it off while the pointer is
+// over its top bar (forwarded mousemove), so ⚙ stays reachable.
+ipcMain.on('overlay:set-ignore-mouse', (_, { on } = {}) => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  try {
+    if (on) overlayWindow.setIgnoreMouseEvents(true, { forward: true });
+    else    overlayWindow.setIgnoreMouseEvents(false);
+  } catch (_) {}
+});
+
+// Quick placement in a corner of the primary display's work area: 16 px from
+// the edge to the card (the window adds 8 px of transparent padding).
+ipcMain.on('overlay:snap', (_, { corner } = {}) => {
+  if (!overlayWindow || overlayWindow.isDestroyed()) return;
+  const wa = screen.getPrimaryDisplay().workArea;
+  const [w, h] = overlayWindow.getSize();
+  const m = 16 - 8;
+  const left = wa.x + m, right = wa.x + wa.width - w - m;
+  const top  = wa.y + m, bottom = wa.y + wa.height - h - m;
+  const pos = { tl: [left, top], tr: [right, top], bl: [left, bottom], br: [right, bottom] }[corner];
+  if (!pos) return;
+  try { overlayWindow.setPosition(Math.round(pos[0]), Math.round(pos[1]), false); } catch (_) {}
 });
 
 ipcMain.on('overlay:pause-all', async () => {
@@ -1080,8 +1259,8 @@ ipcMain.on('overlay:pause-all', async () => {
 ipcMain.handle('overlay:get-shortcuts', () => {
   try {
     const s = readSettings();
-    return { ok: true, stop: s.shortcutStop || '', pause: s.shortcutPause || '' };
-  } catch (_) { return { ok: false, stop: '', pause: '' }; }
+    return { ok: true, stop: s.shortcutStop || '', pause: s.shortcutPause || '', overlay: s.shortcutOverlay || 'F8' };
+  } catch (_) { return { ok: false, stop: '', pause: '', overlay: 'F8' }; }
 });
 
 ipcMain.on('overlay:macro-start', async (_, { name } = {}) => {
@@ -1183,8 +1362,24 @@ ipcMain.handle('app:getConfig', () => ({
   version: app.getVersion(),
 }));
 
+// ── IPC: « Quoi de neuf » — CHANGELOG.md embarqué (package.json build.files) ──
+ipcMain.handle('app:changelog', () => {
+  const candidates = [
+    path.join(__dirname, 'CHANGELOG.md'),           // dev + packagé (dans app.asar)
+    path.join(__dirname, '..', 'CHANGELOG.md'),     // repli : racine du dépôt (dev)
+  ];
+  for (const p of candidates) {
+    try {
+      if (fs.existsSync(p)) return { ok: true, version: app.getVersion(), text: fs.readFileSync(p, 'utf-8') };
+    } catch (_) {}
+  }
+  return { ok: false, version: app.getVersion(), text: '' };
+});
+
 // ── IPC: restart ──────────────────────────────────────────────────────────────
 ipcMain.handle('app:restart', () => {
+  // app.exit() skips will-quit/window-all-closed — kill the engine explicitly.
+  killEngine();
   app.relaunch();
   app.exit(0);
 });
@@ -1231,6 +1426,7 @@ function _stopLicenseWatcher() {
 }
 
 function _onLicenseRevoked(reason) {
+  _licenseRevoked = true;  // blocks _ensureEngineStarted/startEngine until re-validated
   _stopLicenseWatcher();
   killEngine();
   mainWindow?.webContents.send('license:revoked', { reason });
@@ -1261,6 +1457,7 @@ ipcMain.handle('license:check', async () => {
   if (result.valid) {
     writeLog('INFO', '[LIC] Licence valide, rafraîchissement validatedAt');
     saveLicense(licData.key);        // Rafraîchir validatedAt
+    _licenseRevoked = false;
     _pushLicenseStatusToEngine(licData.key, true, false, null, result.result);
     return { valid: true };
   }
@@ -1290,6 +1487,8 @@ ipcMain.handle('license:verify', async (_evt, key) => {
   const result = await verifyLicenseOnline(key.trim());
   if (result.valid) {
     saveLicense(key.trim());
+    _licenseRevoked = false;
+    _startLicenseWatcher();
     _pushLicenseKeyToEngine();
   }
   if (!result.valid && result.offline) return { valid: false, reason: 'network' };
@@ -1307,10 +1506,11 @@ ipcMain.handle('settings:write', (_evt, data) => {
   try {
     saveSettings(data);
     // Notify overlay if shortcuts changed
-    if (data.shortcutStop !== undefined || data.shortcutPause !== undefined) {
+    if (data.shortcutStop !== undefined || data.shortcutPause !== undefined || data.shortcutOverlay !== undefined) {
       _sendToOverlay('overlay:shortcuts-updated', {
-        stop:  data.shortcutStop  || '',
-        pause: data.shortcutPause || '',
+        stop:    data.shortcutStop    || '',
+        pause:   data.shortcutPause   || '',
+        overlay: data.shortcutOverlay || 'F8',
       });
     }
     return { ok: true };
@@ -1404,5 +1604,6 @@ ipcMain.handle('log:clear', () => {
 app.on('will-quit', () => {
   writeLog('INFO', '═══ MacroEngine fermeture ═══');
   globalShortcut.unregisterAll();
+  killEngine();
 });
 
