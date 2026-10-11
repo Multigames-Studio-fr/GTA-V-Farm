@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.6.0] – 2026-10-11
+
+### Added
+- **Nouvelle interface** : DA « Los Santos Nuit », dashboard repensé (macros actives en tête, prochain repas, fil d'activité)
+- **Statistiques de session** : durée, cycles, repas, erreurs, raisons d'arrêt — export CSV et résumé Discord (manuel ou à la fermeture)
+- **Alertes Discord ciblées** : FiveM fermé, erreurs en série, échec Auto Bouffe — avec capture du jeu et mention, jamais perdues par la limite d'envoi
+- **Onglet Notifications** : chaque utilisateur configure son propre webhook Discord
+- **Overlay en jeu** : léger et transparent, déplaçable, réductible en pastille, opacité réglable, clic à travers, raccourci F8
+- **Quoi de neuf** : cette fenêtre s'affiche après chaque mise à jour (rouvrable depuis Paramètres › Système)
+
+### Fixed
+- **Clavier AZERTY** : les touches capturées envoient la bonne touche physique (A/Q, Z/W, é, &…) partout dans l'app
+- **Auto Bouffe** : le coffre se rouvre correctement après avoir mangé
+- **Touches coincées** : plus aucune touche ne reste enfoncée après F12, une erreur ou la fermeture de l'app
+- **Pause F11** : ne saute plus d'actions à la reprise
+- **Moteur en double** : arrêt/relance rapide ou « Redémarrer » ne lancent plus deux moteurs en parallèle
+- **Macros bloquées** : les conditions d'arrêt et le timeout fonctionnent même si FiveM a crashé
+- **Combinaisons de touches** : « ctrl+c » n'est plus tapé lettre par lettre
+
+### Changed
+- **Mises à jour** : chaque fichier téléchargé est vérifié (empreinte SHA256, HTTPS uniquement)
+- **Stabilité** : accents dans les noms de macros, fuite de ressources pendant l'Auto Bouffe, rapport de diagnostic redessiné
+
+---
+
 ## [2.5.12] – 2026-08-07
 
 ### Fixed
