@@ -315,7 +315,7 @@
     <h1 class="rise" style="animation-delay:.08s">Télécharger <span class="grad">MacroEngine</span></h1>
     <p class="tagline rise" style="animation-delay:.14s">Automatisation visuelle par macros. Éditeur de règles, détection à l'écran, dashboard en direct.</p>
 
-    <a class="dl-btn rise" id="dlBtn" style="animation-delay:.2s" href="https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases/latest/download/MacroEngine-Portable.exe" download="MacroEngine-Portable.exe">
+    <a class="dl-btn rise" id="dlBtn" style="animation-delay:.2s" href="https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases/latest">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
       Télécharger — version portable
     </a>
@@ -532,7 +532,11 @@
       requestAnimationFrame(frame);
     })();
 
-    /* ── Nom de fichier de téléchargement à jour (dernière release GitHub) ── */
+    /* ── Lien direct vers l'exe de la dernière release ──
+       Les fichiers portent la version dans leur nom (MacroEngine-Portable-2.6.0.exe),
+       donc l'URL /releases/latest/download/<nom fixe> n'existe plus : on récupère
+       l'URL réelle de l'asset via l'API. Sans réponse, le bouton reste sur la page
+       des releases (href par défaut) — jamais de lien cassé. */
     (function () {
       var btn = document.getElementById('dlBtn');
       var badge = document.getElementById('verBadge');
@@ -542,10 +546,13 @@
         .then(function (data) {
           if (!data || !data.tag_name) return;
           var version = data.tag_name.replace(/^v/i, '');
-          btn.setAttribute('download', 'MacroEngine-' + version + '.exe');
           if (badge) badge.textContent = 'v' + version;
+          var assets = data.assets || [];
+          var exe = assets.find(function (a) { return /Portable.*\.exe$/i.test(a.name); })
+                 || assets.find(function (a) { return /\.exe$/i.test(a.name); });
+          if (exe && exe.browser_download_url) btn.setAttribute('href', exe.browser_download_url);
         })
-        .catch(function () { /* garde le nom de fichier statique déjà présent */ });
+        .catch(function () { /* garde le lien vers la page des releases */ });
     })();
 
     /* ── Bouton magnétique ── */

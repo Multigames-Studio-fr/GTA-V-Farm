@@ -99,7 +99,8 @@ jobs:
         working-directory: electron-app
         run: |
           $ok = $true
-          foreach ($name in @('MacroEngine-Setup.exe', 'MacroEngine-Portable.exe')) {
+          $v = "${{ steps.pkg_version.outputs.VERSION }}"
+          foreach ($name in @("MacroEngine-Setup-$v.exe", "MacroEngine-Portable-$v.exe")) {
             if (-not (Test-Path "dist/$name")) {
               Write-Host "$name not found!" -ForegroundColor Red
               $ok = $false
@@ -129,7 +130,7 @@ jobs:
           tag: ${{ steps.pkg_version.outputs.TAG }}
           name: "MacroEngine v${{ steps.pkg_version.outputs.VERSION }}"
           body: ${{ steps.changelog.outputs.NOTES }}
-          artifacts: "electron-app/dist/MacroEngine-Setup.exe,electron-app/dist/MacroEngine-Portable.exe"
+          artifacts: "electron-app/dist/MacroEngine-Setup-${{ steps.pkg_version.outputs.VERSION }}.exe,electron-app/dist/MacroEngine-Portable-${{ steps.pkg_version.outputs.VERSION }}.exe"
           artifactContentType: "application/octet-stream"
           allowUpdates: true
           removeArtifacts: true

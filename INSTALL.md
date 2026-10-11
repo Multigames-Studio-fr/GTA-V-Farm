@@ -4,7 +4,7 @@
 
 ### Windows 10/11 (64-bit)
 
-1. **Download** `MacroEngine-Setup.exe` from [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
+1. **Download** `MacroEngine-Setup-<version>.exe` from [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
 2. **Run** the installer
 3. **Follow** the setup wizard
 4. **Launch** from Start Menu → "MacroEngine"
@@ -18,7 +18,7 @@
 
 Perfect for USB drives or testing:
 
-1. Download `MacroEngine-Portable.exe`
+1. Download `MacroEngine-Portable-<version>.exe`
 2. Place in any folder (e.g., `C:\Tools\MacroEngine\`)
 3. Run it directly – no installation needed
 4. First launch extracts ~200MB of dependencies

@@ -84,7 +84,7 @@
       ]
     },
     "portable": {
-      "artifactName": "${productName}-Portable.exe"
+      "artifactName": "${productName}-Portable-${version}.exe"
     },
     "nsis": {
       "oneClick": false,
@@ -93,7 +93,7 @@
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
       "shortcutName": "MacroEngine",
-      "artifactName": "${productName}-Setup.exe"
+      "artifactName": "${productName}-Setup-${version}.exe"
     },
     "publish": {
       "provider": "github",

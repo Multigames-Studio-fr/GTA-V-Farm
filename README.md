@@ -42,13 +42,13 @@
 
 ### Méthode 1 : Installeur (recommandé)
 
-1. Télécharge `MacroEngine-Setup.exe` depuis les [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
+1. Télécharge `MacroEngine-Setup-<version>.exe` (ex. `MacroEngine-Setup-2.6.0.exe`) depuis les [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
 2. Lance l'installeur
 3. Ouvre depuis le menu Démarrer ou le raccourci Bureau
 
 ### Méthode 2 : Portable (sans installation)
 
-1. Télécharge `MacroEngine-Portable.exe` depuis les [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
+1. Télécharge `MacroEngine-Portable-<version>.exe` (ex. `MacroEngine-Portable-2.6.0.exe`) depuis les [Releases](https://github.com/Multigames-Studio-fr/GTA-V-Farm/releases)
 2. Lance-le directement — aucune installation nécessaire
 3. Le premier lancement extrait les dépendances une seule fois (mise en cache par version, pas de réextraction aux lancements suivants)
 
